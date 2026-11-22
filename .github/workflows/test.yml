@@ -82,12 +82,25 @@ jobs:
       # THE E2E TESTS SKIP WHEN THEY CANNOT MAKE A DEVICE, so this job asserts they DID NOT SKIP:
       # a green run that skipped everything proves nothing, and that is the failure mode a skipping
       # test is famous for.
+      # SUDO, NOT `unshare -Urn`, BECAUSE GITHUB'S RUNNER FORBIDS UNPRIVILEGED USER NAMESPACES.
+      #
+      # MEASURED on the first green-attempt: `unshare -Urn --keep-caps` answered
+      # `write failed /proc/self/uid_map: Operation not permitted`, so the namespace is restricted on
+      # this image (Ubuntu 23.10+ with the apparmor restriction). Root already has CAP_NET_ADMIN, so
+      # running the test directly as root needs no namespace at all.
+      #
+      # `unshare` REMAINS THE RIGHT ANSWER ON A MACHINE WITHOUT SUDO, and the README documents it -
+      # but it is not what this runner allows.
+      #
+      # THE TEST INSTALLS A POLICY RULE AND A ROUTE IN WHATEVER NAMESPACE IT RUNS IN, which as root is
+      # the runner's own. That is acceptable HERE because a GitHub runner is discarded after the job,
+      # and the test removes what it installed; it is the reason the README prefers `unshare` for a
+      # machine a person keeps.
       - name: test, with the kernel half
         run: |
           set -eux
-          # `--keep-caps` is required: `unshare -U` alone drops the capability set, and the ioctl
-          # then fails with EPERM in a namespace that otherwise allows it.
-          unshare -Urn --keep-caps go test ./... -count=1 -v -run 'E2E|TestOpenTun|TestIfreq' \
+          sudo env "PATH=$PATH" "HOME=$HOME" \
+            go test ./... -count=1 -v -run 'E2E|TestOpenTun|TestIfreq' \
             | tee /tmp/kernel.log
           if grep -q '^--- SKIP' /tmp/kernel.log; then
             echo "::error::a kernel test skipped, so the device was not usable in this job"
@@ -98,5 +111,5 @@ jobs:
 
       # AND THE WHOLE SUITE, which must also pass inside the namespace - a change that only works
       # with privileges would otherwise be found by a user.
-      - name: the whole suite, in the namespace
-        run: unshare -Urn --keep-caps go test ./... -count=1 -race
+      - name: the whole suite, as root
+        run: sudo env "PATH=$PATH" "HOME=$HOME" go test ./... -count=1 -race
