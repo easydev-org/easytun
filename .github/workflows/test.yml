@@ -33,11 +33,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
-          cache: true
+          # NO CACHE: this module has no dependencies, so there is no `go.sum` for the cache key and
+          # every run would warn that it could not restore one. Measured on the first green run.
+          cache: false
       - name: gofmt
         run: |
           set -eu
@@ -57,11 +59,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
-          cache: true
+          # NO CACHE: this module has no dependencies, so there is no `go.sum` for the cache key and
+          # every run would warn that it could not restore one. Measured on the first green run.
+          cache: false
 
       # THE DEVICE NODE. The `tun` module is built into (or loaded by) every kernel GitHub's runners
       # use, so this is the character device that talks to it - major 10, minor 200, which is what
