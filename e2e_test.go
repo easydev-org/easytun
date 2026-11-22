@@ -4,26 +4,20 @@ package easytun
 
 // THE END-TO-END TEST: A REAL TUN DEVICE, A REAL SOCKS5 SERVER, A REAL DATAGRAM.
 //
-// THIS IS THE MIGRATION OF THE ASSERTIONS THAT USED TO LIVE IN easyvm's `alpine-microvm.yml`. That
-// workflow built a whole virtual machine to get a `/dev/net/tun` and then read the kernel's own view
-// of the device - `ip link show`, `ip -4 addr`, `ip rule`, `ip route show table N` - because those are
-// the only place the claims can be checked. None of that needed the virtual machine; it needed a tun
-// device and the capability to make one. So the device is the fixture now, and the guest is not
-// booted at all.
+// THE DEVICE IS THE FIXTURE. It is the only part of this package that cannot be unit-tested - the
+// ioctl, the address, the policy rule and the route are all things the kernel does to a real device -
+// so the tests here create one and read the kernel's own view of it:
 //
-// WHAT IT PROVES, ONE LINE PER ASSERTION THE OLD JOB MADE:
-//
-//	Preflight succeeds                     the container has the device and the capability
 //	ip link show <name>                    the device exists and is UP
 //	ip -4 addr shows 10.99.<n>.1/24        it is addressed, so the route cannot blackhole
 //	ip rule names `ipproto udp`            only this guest's UDP is taken, not its TCP
-//	ip route show table <n> has a default   the table the rule points at is populated
+//	ip route show table <n> has a default  the table the rule points at is populated
 //	a datagram goes out and comes back      the framing, the proxy and the reply rewrite all work
 //	Close removes the device and the rule   a route outliving its device breaks every later run
 //
 // HOW TO RUN IT. It needs `--device /dev/net/tun --cap-add NET_ADMIN`, which is the same two flags
 // the README asks a caller for. Without them it SKIPS with the reason, so `go test ./...` is still
-// green on a runner that has neither - and the CI job that does have them will run it.
+// green on a machine that has neither - and the CI job that does have them will run it.
 //
 //	A USER NAMESPACE IS ENOUGH, WITHOUT ROOT: `unshare -Urn --keep-caps go test ./... -run E2E`
 //	grants CAP_NET_ADMIN inside an isolated network namespace, and the whole test - including the

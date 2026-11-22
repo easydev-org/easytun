@@ -113,7 +113,9 @@ jobs:
           fi
           grep -c '^--- PASS' /tmp/kernel.log
 
-      # AND THE WHOLE SUITE, which must also pass inside the namespace - a change that only works
-      # with privileges would otherwise be found by a user.
+      # AND THE WHOLE SUITE AS ROOT, which is the environment the kernel tests describe. The unit
+      # tests that open a loopback socket call `ensureLoopbackUp` first, so this also proves they pass
+      # where `lo` needed raising - the failure a fresh `unshare -Urn` namespace produced while this
+      # work was being written.
       - name: the whole suite, as root
         run: sudo env "PATH=$PATH" "HOME=$HOME" go test ./... -count=1 -race

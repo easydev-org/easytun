@@ -17,7 +17,7 @@ import (
 // the flags word as the IP version, and the relay logged `ipversion=6 proto=128` on a device that was
 // working correctly. A refactor that drops the flag breaks every packet and nothing else says so.
 func TestOpenTunAsksForNoProtocolInfo(t *testing.T) {
-	req := buildIfreq("easyvm-udp")
+	req := buildIfreq("relay-udp")
 	if req.flags&iffNoPI == 0 {
 		t.Fatal("IFF_NO_PI is not set: the kernel will prefix four bytes and every read will parse " +
 			"the flags word as the IP version")
@@ -34,11 +34,11 @@ func TestOpenTunAsksForNoProtocolInfo(t *testing.T) {
 
 // THE NAME IS COPIED, NOT TRUNCATED SILENTLY, and the struct must be the size the ioctl expects.
 func TestIfreqHoldsTheNameAndIsTheExpectedSize(t *testing.T) {
-	req := buildIfreq("easyvm-udp")
-	if got := string(req.name[:len("easyvm-udp")]); got != "easyvm-udp" {
+	req := buildIfreq("relay-udp")
+	if got := string(req.name[:len("relay-udp")]); got != "relay-udp" {
 		t.Fatalf("name = %q", got)
 	}
-	if req.name[len("easyvm-udp")] != 0 {
+	if req.name[len("relay-udp")] != 0 {
 		t.Fatal("the name is not NUL-terminated inside its 16 bytes")
 	}
 	// 16 name + 2 flags + 22 padding = 40, which is what linux/amd64's `struct ifreq` is. A wrong
@@ -96,7 +96,7 @@ func TestCloseOnNilIsSafe(t *testing.T) {
 // tableFor must not give two device names the same table, or two relays in one namespace install
 // their rules into one table and see each other's traffic.
 func TestTableForIsStableAndInRange(t *testing.T) {
-	for _, name := range []string{"tun0", "easyvm-udp", "a", "relay-1", "relay-2"} {
+	for _, name := range []string{"tun0", "relay-udp", "a", "relay-1", "relay-2"} {
 		n := tableFor(name)
 		if n < 100 || n > 199 {
 			t.Errorf("tableFor(%q) = %d, outside 100..199", name, n)
@@ -147,7 +147,7 @@ func TestChooseTableTakesTheHashBucketWhenItIsFree(t *testing.T) {
 	tableInUse = func(int) bool { return false }
 	defer func() { tableInUse = old }()
 
-	for _, name := range []string{"tun0", "easyvm-udp", "relay-7"} {
+	for _, name := range []string{"tun0", "relay-udp", "relay-7"} {
 		if got, want := chooseTable(name, 0), tableFor(name); got != want {
 			t.Errorf("chooseTable(%q) = %d, want its hash bucket %d", name, got, want)
 		}

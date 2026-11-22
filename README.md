@@ -12,7 +12,7 @@ if err := easytun.Preflight(); err != nil {
 r, err := easytun.Start(easytun.Config{
     GuestIP:  "172.30.0.2",
     Upstream: "mihomo.develop.svc.cluster.local:7891",
-    Name:     "easyvm-udp",
+    Name:     "relay-udp",
 })
 if err != nil {
     log.Fatal(err)
@@ -113,14 +113,28 @@ implementation.
 
 There are two layers, because the tun device is a kernel thing and the rest is not.
 
-**Unit — every machine, no privileges.** The forwarding path is driven through a pipe in
-`relay_test.go`, against a real in-process SOCKS5 server, not a mock. The session table, the
-handshake and the framing are all covered here. `go test ./...` skips the kernel half and stays green
-on a runner with nothing mounted.
+**Unit — every machine, no privileges.** The forwarding path is driven through a pipe, against real
+in-process servers, not mocks. Every public field is covered, because a knob that is accepted and
+ignored is worse than one that is rejected:
 
-**E2E — a real device.** `e2e_test.go` migrates the assertions that used to live in easyvm's
-`alpine-microvm.yml`, which built a whole virtual machine just to obtain a `/dev/net/tun` and then read
-the kernel's own view of it. The device is the fixture now:
+| what | how it is checked |
+|---|---|
+| the framing | build/parse round trips, and a packet that is not IPv4 UDP is refused |
+| SOCKS5 | the handshake, then a datagram out and its reply rewritten back into the tun |
+| a name on the wire | `Route.Host` becomes ATYP 3, and an empty one is byte-for-byte the address form |
+| `Route.Direct` | dials the destination with no proxy, and its reply comes back as the source |
+| `Route.Direct` + `Host` | dials the NAME, so an invented address never reaches the network |
+| `Route.Drop` | sends nothing |
+| `Config.Table` | the caller's number reaches the rule, not the hash bucket |
+| `Config.Logf` | receives each failure; nil is silent, not a panic |
+| `Config.Name` | empty becomes `tun0`, and the relay remembers it for `Close` |
+| `Close` | idempotent, and it reports a cleanup it could not finish |
+
+`go test ./...` skips the kernel half and stays green on a machine with nothing mounted.
+
+**E2E — a real device.** `e2e_test.go` creates a tun device and reads the kernel's own view of it,
+because the ioctl, the address, the policy rule and the route cannot be asserted any other way. The
+device is the fixture:
 
 | claim | how it is checked |
 |---|---|
@@ -141,6 +155,11 @@ unshare -Urn --keep-caps go test ./... -run E2E -v
 `--keep-caps` matters: `unshare -U` alone drops the capability set and the ioctl then fails with EPERM
 in a namespace that otherwise allows it. The policy routing the test installs stays inside the
 namespace, so it cannot leak onto the host.
+
+Loopback is **down** in a fresh namespace, and every socket test depends on it being up — so the tests
+raise it themselves (`ensureLoopbackUp`). MEASURED: without that, a listener bound to `127.0.0.1`
+accepts a connect attempt and never completes it, and the symptom is a five-second timeout that reads
+as "the relay is broken".
 
 Without a usable device the e2e tests **skip with the reason**, which is why the CI job in
 `.github/workflows/test.yml` asserts that none of them skipped — a green run that skipped everything
