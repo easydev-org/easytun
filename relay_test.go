@@ -278,3 +278,164 @@ func TestADroppedFlowSendsNothing(t *testing.T) {
 		// correct: silence
 	}
 }
+
+// --- an egress fixture: two proxies that say WHICH one carried a datagram -------------
+//
+// PROVING A ROUTE IS NOT PROVING A CONNECTION. `proxy` and `direct` both succeed, so a passing check
+// says nothing about which path was taken. The only way to tell them apart from outside is to have
+// each upstream TAG what it carried - which is what this fixture does: it answers with its own name,
+// so the payload that arrives back at the guest is the evidence.
+
+// tagProxy is a SOCKS5 UDP server that prefixes every reply with its own tag.
+type tagProxy struct {
+	*socksUDPEcho
+	tag string
+}
+
+// startTagProxy is startSocksUDPEcho with the echo replaced by "<tag>:<payload>".
+func startTagProxy(t *testing.T, tag string) *tagProxy {
+	t.Helper()
+	p := &tagProxy{tag: tag}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ensureLoopbackUp(t)
+	p.socksUDPEcho = &socksUDPEcho{ln: ln, done: make(chan struct{})}
+	go p.serveTagged()
+	t.Cleanup(func() {
+		close(p.done)
+		_ = ln.Close()
+	})
+	return p
+}
+
+func (p *tagProxy) serveTagged() {
+	for {
+		c, err := p.ln.Accept()
+		if err != nil {
+			return
+		}
+		go p.handleTagged(c)
+	}
+}
+
+func (p *tagProxy) handleTagged(c net.Conn) {
+	defer c.Close()
+	hdr := make([]byte, 2)
+	if _, err := io.ReadFull(c, hdr); err != nil {
+		return
+	}
+	if _, err := io.ReadFull(c, make([]byte, hdr[1])); err != nil {
+		return
+	}
+	if _, err := c.Write([]byte{5, 0}); err != nil {
+		return
+	}
+	req := make([]byte, 4)
+	if _, err := io.ReadFull(c, req); err != nil {
+		return
+	}
+	if req[1] != 3 {
+		return
+	}
+	switch req[3] {
+	case 1:
+		_, _ = io.ReadFull(c, make([]byte, 4))
+	case 4:
+		_, _ = io.ReadFull(c, make([]byte, 16))
+	case 3:
+		l := make([]byte, 1)
+		if _, err := io.ReadFull(c, l); err != nil {
+			return
+		}
+		_, _ = io.ReadFull(c, make([]byte, int(l[0])))
+	}
+	_, _ = io.ReadFull(c, make([]byte, 2))
+
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		return
+	}
+	defer udp.Close()
+
+	rep := make([]byte, 10)
+	rep[0], rep[1], rep[3] = 5, 0, 1
+	copy(rep[4:8], net.IPv4(127, 0, 0, 1).To4())
+	binary.BigEndian.PutUint16(rep[8:10], uint16(udp.LocalAddr().(*net.UDPAddr).Port))
+	if _, err := c.Write(rep); err != nil {
+		return
+	}
+
+	buf := make([]byte, 65535)
+	for {
+		n, from, err := udp.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		dstIP, dstPort, payload, ok := socksUDPReply(buf[:n])
+		if !ok {
+			continue
+		}
+		// THE TAG IS THE EVIDENCE: it names the proxy that carried this datagram.
+		body := append([]byte(p.tag+":"), payload...)
+		back := socksUDPRequest([4]byte{dstIP.To4()[0], dstIP.To4()[1], dstIP.To4()[2], dstIP.To4()[3]},
+			dstPort, body)
+		_, _ = udp.WriteToUDP(back, from)
+	}
+}
+
+// startUDPEcho answers a datagram on loopback with "<tag>:<payload>", standing in for a direct
+// destination so a `Route.Direct` flow has something to reach that is not a proxy.
+func startUDPEcho(t *testing.T, tag string) (addr string) {
+	t.Helper()
+	ensureLoopbackUp(t)
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, from, err := c.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			_, _ = c.WriteToUDP(append([]byte(tag+":"), buf[:n]...), from)
+		}
+	}()
+	return c.LocalAddr().String()
+}
+
+// withStubbedDevices points the relay at a pipe and skips the kernel work, restoring everything when
+// the test ends.
+//
+// THIS IS THE SEAM THE EGRESS TESTS NEED: `openTun`, `bringUp` and `installPolicy` are variables
+// precisely so a test on a machine with no device can still drive the whole forwarding path.
+func withStubbedDevices(t *testing.T, dev tunDevice) {
+	t.Helper()
+	oldOpen, oldUp, oldPolicy, oldRemovePolicy, oldRemoveDevice :=
+		openDevice, bringUp, installPolicy, removePolicy, removeDevice
+	openDevice = func(string) (tunDevice, error) { return dev, nil }
+	bringUp = func(string, string) error { return nil }
+	installPolicy = func(string, string, int) error { return nil }
+	removePolicy = func(string, int) error { return nil }
+	removeDevice = func(string) error { return nil }
+	t.Cleanup(func() {
+		openDevice, bringUp, installPolicy = oldOpen, oldUp, oldPolicy
+		removePolicy, removeDevice = oldRemovePolicy, oldRemoveDevice
+	})
+}
+
+// atoi16 parses a decimal port from a SplitHostPort result.
+func atoi16(s string) uint16 {
+	var n uint16
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + uint16(c-'0')
+	}
+	return n
+}

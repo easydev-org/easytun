@@ -1,0 +1,173 @@
+name: egress
+
+# EGRESS ROUTING, IN REAL CONTAINERS, WITH REAL PROXIES.
+#
+# The unit tests drive `Route` through a pipe and prove the choice is made. This proves it END TO END
+# with the two things a pipe cannot give: a REAL TUN DEVICE, and real proxy processes in their own
+# containers that record what they carried.
+#
+# THE QUESTION IS "WHICH PATH", AND A PASSING CONNECTION DOES NOT ANSWER IT. `proxy:A`, `proxy:B` and
+# `direct` all deliver a datagram, so asserting "something came back" proves nothing. Each proxy in
+# this job appends the destination it was asked for to a log, and the assertions are on those logs:
+#
+#	proxy:A   the destination appears in A's log, and NOT in B's
+#	proxy:B   the reverse
+#	direct    it appears in NEITHER log
+#	drop      nothing arrives anywhere
+#
+# THE CROSS-CHECKS ARE THE POINT. Without "and not in the other", a bug that sent everything to A
+# would satisfy the first assertion.
+#
+# A PROXY PER CONTAINER, AND THE RELAY IN ITS OWN. The relay needs `--device /dev/net/tun` and
+# `--cap-add NET_ADMIN`; the proxies need neither, and keeping them separate is what lets their logs
+# be read as two independent records rather than one process's memory.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: egress-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # THE TWO UPSTREAM NAMES the test uses, so a failure can say which was expected.
+  PRIMARY: "proxy-a"
+  BACKUP: "proxy-b"
+
+jobs:
+  egress:
+    name: egress routing (real device, real proxies)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache: false
+
+      # THE DEVICE NODE. The `tun` module is loaded on every kernel GitHub's runners use, so this is
+      # the character device that talks to it: major 10, minor 200.
+      - name: ensure /dev/net/tun exists
+        run: |
+          set -eux
+          if [ ! -e /dev/net/tun ]; then
+            sudo mkdir -p /dev/net
+            sudo mknod /dev/net/tun c 10 200
+            sudo chmod 666 /dev/net/tun
+          fi
+          ls -l /dev/net/tun
+
+      # THE TWO PROXIES, BUILT FROM THIS REPOSITORY. `testdata/proxy-log` is a SOCKS5 UDP server that
+      # records the destination it was asked for and answers with a tag, so both the log and the reply
+      # carry the evidence. It is a separate module so `go build ./...` at the root does not include it.
+      - name: build the two proxies
+        # `testdata/proxy-log` IS ITS OWN MODULE, so this builds from inside it rather than from the
+        # library's root - a `go build ./testdata/...` from the root answers "main module does not
+        # contain package", MEASURED while writing this.
+        run: |
+          set -eux
+          mkdir -p /tmp/proxies
+          ( cd testdata/proxy-log && CGO_ENABLED=0 go build -o /tmp/proxies/socks . )
+          ls -l /tmp/proxies/socks
+
+      - name: start the two proxies in their own containers, each logging what it carries
+        run: |
+          set -eux
+          mkdir -p /tmp/logs
+          chmod 777 /tmp/logs
+
+          # A CONTAINER PER PROXY, SO THE TWO LOGS ARE TWO RECORDS rather than one process's state.
+          # `--network host` is what lets the relay in its own container reach them on 127.0.0.1.
+          for pair in "primary:18081:A" "backup:18082:B"; do
+            name=${pair%%:*}
+            rest=${pair#*:}
+            port=${rest%%:*}
+            tag=${rest#*:}
+            docker run -d --name "socks-$name" \
+              --network host \
+              -v /tmp/proxies/socks:/bin/socks:ro \
+              -v "/tmp/logs:/logs" \
+              alpine:3.21 /bin/socks \
+                --port "$port" --tag "$tag" --log "/logs/$name.log"
+          done
+
+          # READY IS THE PORT ANSWERING, not a sleep. A proxy that never bound would otherwise be read
+          # as "the relay sent nothing", which is the wrong conclusion.
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/18081) 2>/dev/null &&
+               (exec 3<>/dev/tcp/127.0.0.1/18082) 2>/dev/null; then break; fi
+            sleep 1
+          done
+          docker logs socks-primary 2>&1 | tail -5 || true
+          docker logs socks-backup 2>&1 | tail -5 || true
+
+      # THE RELAY, WITH A REAL DEVICE, IN ITS OWN CONTAINER. It is the thing under test, and it is
+      # compiled from this checkout so the run is about this commit.
+      - name: build the egress driver
+        # ALSO ITS OWN MODULE, and it imports the library by the published tag rather than by a
+        # replace directive - so this job tests the version a caller would actually get.
+        run: |
+          set -eux
+          ( cd testdata/egress-driver && CGO_ENABLED=0 go build -o /tmp/egress-driver . )
+          ls -l /tmp/egress-driver
+
+      - name: run the four-outcome policy against real proxies
+        run: |
+          set -eux
+          # THE DRIVER'S EXIT CODE IS THE ASSERTION. It sends one datagram to each destination,
+          # compares the tag that came back, and exits non-zero on the first mismatch.
+          docker run --rm \
+            --name egress \
+            --network host \
+            --cap-add NET_ADMIN \
+            --device /dev/net/tun:/dev/net/tun \
+            -v /tmp/egress-driver:/bin/egress:ro \
+            -e PRIMARY_ADDR="127.0.0.1:18081" \
+            -e BACKUP_ADDR="127.0.0.1:18082" \
+            -v "/tmp/logs:/logs" \
+            alpine:3.21 /bin/egress
+
+      # THE LOGS ARE THE EVIDENCE, AND THEY ARE READ EVEN WHEN THE DRIVER PASSED - a driver that
+      # asserted the right thing by accident would still leave the wrong log.
+      - name: assert on what each proxy CARRIED
+        run: |
+          set -eux
+          echo "=== primary carried ==="; cat /tmp/logs/primary.log 2>/dev/null || echo "(empty)"
+          echo "=== backup carried ===";  cat /tmp/logs/backup.log  2>/dev/null || echo "(empty)"
+
+          P=$(cat /tmp/logs/primary.log 2>/dev/null || true)
+          B=$(cat /tmp/logs/backup.log  2>/dev/null || true)
+          fail() { echo "::error::$*"; exit 1; }
+
+          # `case` RATHER THAN `grep -q`, because grep closing the pipe makes the writer take SIGPIPE
+          # and `set -o pipefail` turns a successful check into exit 141.
+          case "$P" in *"203.0.113.10"*) ;; *) fail "the destination ruled to primary never reached primary" ;; esac
+          case "$B" in *"203.0.113.20"*) ;; *) fail "the destination ruled to backup never reached backup" ;; esac
+
+          # AND THE CROSS-CHECKS, without which "everything went to primary" would pass.
+          case "$B" in *"203.0.113.10"*) fail "a destination ruled to primary was carried by BACKUP" ;; esac
+          case "$P" in *"203.0.113.20"*) fail "a destination ruled to backup was carried by PRIMARY" ;; esac
+
+          # DIRECT LEAVES NO TRACE IN A PROXY, which is the only way to prove it went direct.
+          case "$P$B" in *"203.0.113.30"*) fail "a direct destination appears in a proxy log" ;; esac
+          # AND THE DROPPED ONE REACHED NOBODY.
+          case "$P$B" in *"203.0.113.40"*) fail "a dropped destination reached a proxy" ;; esac
+
+          echo "all four outcomes took the path the rules chose"
+
+      - name: always, the logs
+        if: always()
+        run: |
+          docker logs socks-primary 2>&1 | tail -20 || true
+          docker logs socks-backup  2>&1 | tail -20 || true
+          echo "--- primary ---"; cat /tmp/logs/primary.log 2>/dev/null || true
+          echo "--- backup ---";  cat /tmp/logs/backup.log  2>/dev/null || true
+
+      - name: clean up
+        if: always()
+        run: docker rm -f socks-primary socks-backup 2>/dev/null || true
