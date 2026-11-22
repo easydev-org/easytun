@@ -66,12 +66,16 @@ jobs:
       # THE DEVICE NODE. The `tun` module is built into (or loaded by) every kernel GitHub's runners
       # use, so this is the character device that talks to it - major 10, minor 200, which is what
       # /proc/misc reports as `tun`.
-      - name: create /dev/net/tun
+      - name: ensure /dev/net/tun exists
+        # GITHUB'S RUNNER ALREADY HAS ONE, which is why `mknod` must tolerate EEXIST: MEASURED,
+        # the first version failed here with `mknod: File exists` and never ran a test.
         run: |
           set -eux
-          sudo mkdir -p /dev/net
-          sudo mknod /dev/net/tun c 10 200
-          sudo chmod 666 /dev/net/tun
+          if [ ! -e /dev/net/tun ]; then
+            sudo mkdir -p /dev/net
+            sudo mknod /dev/net/tun c 10 200
+            sudo chmod 666 /dev/net/tun
+          fi
           ls -l /dev/net/tun
           grep tun /proc/misc
 
