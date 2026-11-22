@@ -111,11 +111,37 @@ implementation.
 
 ## Testing
 
-The forwarding path is driven through a pipe in `relay_test.go`, against a real in-process SOCKS5
-server — not a mock. That keeps the session table, the handshake and the framing under test on a
-runner with no tun device. The kernel half — the ioctl and the policy-routing commands — is asserted
-by `TestOpenTunAsksForNoProtocolInfo` and the `chooseTable` tests.
+There are two layers, because the tun device is a kernel thing and the rest is not.
+
+**Unit — every machine, no privileges.** The forwarding path is driven through a pipe in
+`relay_test.go`, against a real in-process SOCKS5 server, not a mock. The session table, the
+handshake and the framing are all covered here. `go test ./...` skips the kernel half and stays green
+on a runner with nothing mounted.
+
+**E2E — a real device.** `e2e_test.go` migrates the assertions that used to live in easyvm's
+`alpine-microvm.yml`, which built a whole virtual machine just to obtain a `/dev/net/tun` and then read
+the kernel's own view of it. The device is the fixture now:
+
+| claim | how it is checked |
+|---|---|
+| the device exists and is up | `ip link show <name>` |
+| it is addressed, so a route cannot blackhole | `ip -4 addr` shows `10.99.<n>.1/24` |
+| only this guest's UDP is taken, not its TCP | `ip rule` names `ipproto udp`, and no broader rule exists |
+| the table the rule points at is populated | `ip route show table <n>` has a default |
+| a datagram goes out and comes back | a real socket from the guest address, through a real SOCKS5 server |
+| `Close` removes the device and the rule | both are gone afterwards |
+
+A **user namespace is enough** — no root, no privileged container:
 
 ```sh
-go test ./... -race
+sudo mknod /dev/net/tun c 10 200 && sudo chmod 666 /dev/net/tun   # the tun module is already loaded
+unshare -Urn --keep-caps go test ./... -run E2E -v
 ```
+
+`--keep-caps` matters: `unshare -U` alone drops the capability set and the ioctl then fails with EPERM
+in a namespace that otherwise allows it. The policy routing the test installs stays inside the
+namespace, so it cannot leak onto the host.
+
+Without a usable device the e2e tests **skip with the reason**, which is why the CI job in
+`.github/workflows/test.yml` asserts that none of them skipped — a green run that skipped everything
+proves nothing.

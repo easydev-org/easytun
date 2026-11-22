@@ -1,0 +1,98 @@
+name: test
+
+# THE KERNEL HALF OF THIS PACKAGE CANNOT BE UNIT-TESTED. `IFF_NO_PI`, the ioctl, the policy rule and
+# the route are all things the kernel does to a real device, and a test that mocked them would prove
+# nothing about the ioctl that actually matters. So there are two jobs:
+#
+#	test    every machine, no privileges: the packet layer, the SOCKS5 framing, the relay's session
+#	        table and the whole forwarding path, driven through a pipe against a real in-process
+#	        SOCKS5 server. This is the `go test ./...` anyone runs.
+#
+#	kernel  one runner with `--device /dev/net/tun --cap-add NET_ADMIN`: the same suite PLUS the e2e
+#	        tests, which create a real tun device, install a real policy rule, send a real datagram
+#	        through a real proxy and read the reply back off a real socket.
+#
+# AND `unshare -Urn --keep-caps` IS WHY THIS NEEDS NO PRIVILEGED CONTAINER. A user namespace gives the
+# process CAP_NET_ADMIN inside an isolated network namespace, so the policy routing the test installs
+# stays inside that namespace and cannot leak onto the runner. The device node is created once with
+# `mknod` - the tun module is already loaded on every Linux kernel GitHub ships.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: unit (no privileges)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: gofmt
+        run: |
+          set -eu
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./... -count=1 -race -cover
+
+  kernel:
+    name: e2e (a real tun device)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      # THE DEVICE NODE. The `tun` module is built into (or loaded by) every kernel GitHub's runners
+      # use, so this is the character device that talks to it - major 10, minor 200, which is what
+      # /proc/misc reports as `tun`.
+      - name: create /dev/net/tun
+        run: |
+          set -eux
+          sudo mkdir -p /dev/net
+          sudo mknod /dev/net/tun c 10 200
+          sudo chmod 666 /dev/net/tun
+          ls -l /dev/net/tun
+          grep tun /proc/misc
+
+      # THE E2E TESTS SKIP WHEN THEY CANNOT MAKE A DEVICE, so this job asserts they DID NOT SKIP:
+      # a green run that skipped everything proves nothing, and that is the failure mode a skipping
+      # test is famous for.
+      - name: test, with the kernel half
+        run: |
+          set -eux
+          # `--keep-caps` is required: `unshare -U` alone drops the capability set, and the ioctl
+          # then fails with EPERM in a namespace that otherwise allows it.
+          unshare -Urn --keep-caps go test ./... -count=1 -v -run 'E2E|TestOpenTun|TestIfreq' \
+            | tee /tmp/kernel.log
+          if grep -q '^--- SKIP' /tmp/kernel.log; then
+            echo "::error::a kernel test skipped, so the device was not usable in this job"
+            grep -A3 '^--- SKIP' /tmp/kernel.log
+            exit 1
+          fi
+          grep -c '^--- PASS' /tmp/kernel.log
+
+      # AND THE WHOLE SUITE, which must also pass inside the namespace - a change that only works
+      # with privileges would otherwise be found by a user.
+      - name: the whole suite, in the namespace
+        run: unshare -Urn --keep-caps go test ./... -count=1 -race
