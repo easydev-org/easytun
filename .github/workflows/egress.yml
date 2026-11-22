@@ -116,6 +116,16 @@ jobs:
           ( cd testdata/egress-driver && CGO_ENABLED=0 go build -o /tmp/egress-driver . )
           ls -l /tmp/egress-driver
 
+      # THE RELAY CONTAINER NEEDS REAL iproute2, NOT BUSYBOX.
+      #
+      # MEASURED on the first run: alpine:3.21's `/sbin/ip` is busybox, which has no `ipproto`, so the
+      # relay answered
+      #
+      #	`ip rule add from 172.30.0.2/32 ipproto udp lookup 162`: ip: invalid argument 'ipproto' to 'ip'
+      #
+      # `ipproto udp` IS THE RULE'S WHOLE POINT - without it the rule takes the guest's TCP as well -
+      # so installing iproute2 is a requirement of the test, not a workaround for it. The library now
+      # names that package in its own error rather than leaving the busybox message to be decoded.
       - name: run the four-outcome policy against real proxies
         run: |
           set -eux
@@ -130,7 +140,7 @@ jobs:
             -e PRIMARY_ADDR="127.0.0.1:18081" \
             -e BACKUP_ADDR="127.0.0.1:18082" \
             -v "/tmp/logs:/logs" \
-            alpine:3.21 /bin/egress
+            alpine:3.21 sh -c 'apk add --no-cache iproute2 >/dev/null && exec /bin/egress' 
 
       # THE LOGS ARE THE EVIDENCE, AND THEY ARE READ EVEN WHEN THE DRIVER PASSED - a driver that
       # asserted the right thing by accident would still leave the wrong log.

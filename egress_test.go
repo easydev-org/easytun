@@ -20,6 +20,7 @@ package easytun
 
 import (
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -225,5 +226,52 @@ func TestTwoFlowsThroughOneProxyStaySeparate(t *testing.T) {
 	}
 	if got := ask(t, dev, reader, guest, 30002, net.ParseIP("203.0.113.11"), 443, "two", 3*time.Second); got != "A:two" {
 		t.Errorf("flow two answered %q", got)
+	}
+}
+
+// A BUSYBOX `ip` CANNOT FILTER BY PROTOCOL, AND THE REFUSAL MUST SAY SO.
+//
+// MEASURED on alpine:3.21: `/sbin/ip` is busybox, `ipproto` does not exist, and the answer is
+//
+//	ip: invalid argument 'ipproto' to 'ip'
+//
+// which names neither the binary nor the package to install. And it cannot be papered over by dropping
+// the flag: `ipproto udp` is the rule's whole point - without it the rule takes the guest's TCP too,
+// sending it into a tun that only carries datagrams.
+func TestAPolicyFailureNamesTheMissingIpproto(t *testing.T) {
+	oldRun := runFn
+	defer func() { runFn = oldRun }()
+	runFn = func(name string, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "rule" {
+			return "ip: invalid argument 'ipproto' to 'ip'", errFake("exit status 1")
+		}
+		return "", nil
+	}
+
+	err := installPolicy("tun0", "172.30.0.2", 162)
+	if err == nil {
+		t.Fatal("installPolicy accepted a busybox ip")
+	}
+	if !strings.Contains(err.Error(), "iproute2") {
+		t.Fatalf("the error does not name the package to install: %v", err)
+	}
+	if !strings.Contains(err.Error(), "busybox") {
+		t.Fatalf("the error does not name the cause: %v", err)
+	}
+}
+
+// AND AN ORDINARY FAILURE IS STILL ORDINARY, so the special case above does not swallow every error.
+func TestAnOrdinaryPolicyFailureIsReportedPlainly(t *testing.T) {
+	oldRun := runFn
+	defer func() { runFn = oldRun }()
+	runFn = func(name string, args ...string) (string, error) {
+		return "RTNETLINK answers: Operation not permitted", errFake("exit status 2")
+	}
+	err := installPolicy("tun0", "172.30.0.2", 162)
+	if err == nil {
+		t.Fatal("installPolicy accepted a failure")
+	}
+	if strings.Contains(err.Error(), "busybox") {
+		t.Fatalf("an EPERM was reported as a busybox problem: %v", err)
 	}
 }

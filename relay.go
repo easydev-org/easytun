@@ -224,9 +224,22 @@ var installPolicy = func(name, guestIP string, table int) error {
 		if out, err := run("ip", step...); err != nil {
 			// A RULE THAT ALREADY EXISTS IS NOT A FAILURE: Start can be called twice on a daemon that
 			// was restarted without its network being torn down, and EEXIST is the same state.
-			if !contains(out, "File exists") {
-				return fmt.Errorf("`ip %v`: %v (%s)", step, err, firstLine(out))
+			if contains(out, "File exists") {
+				continue
 			}
+			// `ipproto` IS AN IPROUTE2 EXTENSION THAT BUSYBOX'S `ip` DOES NOT HAVE, and its answer -
+			// `invalid argument 'ipproto' to 'ip'` - names neither the binary nor the fix. MEASURED on
+			// alpine:3.21, whose `/sbin/ip` is busybox by default.
+			//
+			// THIS MATTERS BECAUSE `ipproto udp` IS THE RULE'S WHOLE POINT: without it the rule would
+			// take the guest's TCP as well, which is the failure the flag exists to prevent. So the
+			// refusal is not softened into a broader rule - it names the missing package instead.
+			if contains(out, "ipproto") {
+				return fmt.Errorf("`ip %v`: %v (%s). This ip cannot filter by protocol, so the rule "+
+					"would take ALL of the guest's traffic rather than its UDP. It is busybox or an "+
+					"old iproute2: install iproute2", step, err, firstLine(out))
+			}
+			return fmt.Errorf("`ip %v`: %v (%s)", step, err, firstLine(out))
 		}
 	}
 	return nil
