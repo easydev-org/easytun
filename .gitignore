@@ -1,0 +1,2 @@
+# a built test binary from an ad-hoc `go test -c`
+*.test
