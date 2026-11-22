@@ -80,14 +80,58 @@ func socksUDPRequest(dstIP [4]byte, dstPort uint16, payload []byte) []byte {
 	return out
 }
 
+// socksUDPTarget frames a datagram for a NAME when one is given, and an address otherwise.
+//
+// SOCKS5 CARRIES A DOMAIN AS ATYP 3 - a length byte and the bytes of the name - and it exists for
+// exactly this case: the caller has a name and the address is one it invented, so the proxy is the
+// only thing that can resolve it. Using the address form for a fake destination would ask the proxy
+// for a host that cannot exist.
+//
+// THE PORT IS STILL NEEDED IN THE ADDRESS FORM, and a domain carries its own length so there is no
+// fixed 4-byte address to copy - which is why this is a separate function rather than a flag on the
+// address one.
+func socksUDPTarget(dstIP [4]byte, dstPort uint16, host string, payload []byte) []byte {
+	if host == "" {
+		return socksUDPRequest(dstIP, dstPort, payload)
+	}
+	if len(host) > 255 {
+		// A DNS NAME CANNOT EXCEED 255 BYTES, and a length byte that wrapped would send a truncated
+		// name the proxy resolves to something else.
+		host = host[:255]
+	}
+	out := make([]byte, 0, 7+len(host)+len(payload))
+	out = append(out, 0, 0, 0, 3) // RSV, FRAG=0, ATYP=domain
+	out = append(out, byte(len(host)))
+	out = append(out, host...)
+	var p [2]byte
+	binary.BigEndian.PutUint16(p[:], dstPort)
+	out = append(out, p[:]...)
+	out = append(out, payload...)
+	return out
+}
+
 // socksUDPReply strips that framing from a reply.
 //
 // FRAGMENTED REPLIES ARE NOT SUPPORTED and there is no reason to: the fragmentation field exists for
 // proxies that split a datagram, none of the ones measured do, and a partial UDP datagram is useless
 // to the guest anyway.
 func socksUDPReply(b []byte) (net.IP, uint16, []byte, bool) {
-	if len(b) < 10 || b[0] != 0 || b[1] != 0 || b[2] != 0 || b[3] != 1 {
+	if len(b) < 10 || b[0] != 0 || b[1] != 0 || b[2] != 0 {
 		return nil, 0, nil, false
 	}
-	return net.IP(b[4:8]), binary.BigEndian.Uint16(b[8:10]), b[10:], true
+	switch b[3] {
+	case 1: // IPv4
+		return net.IP(b[4:8]), binary.BigEndian.Uint16(b[8:10]), b[10:], true
+	case 4: // IPv6
+		if len(b) < 22 {
+			return nil, 0, nil, false
+		}
+		return net.IP(b[4:20]), binary.BigEndian.Uint16(b[20:22]), b[22:], true
+	default:
+		// A DOMAIN IN A REPLY (ATYP 3) IS REFUSED: this relay asked with an address or a name and needs
+		// an ADDRESS back to build the packet the guest receives - a reply naming a domain gives it
+		// nothing to put in the source field, and resolving it here would be a second lookup on the
+		// reply path.
+		return nil, 0, nil, false
+	}
 }

@@ -54,6 +54,13 @@ type Route struct {
 	Drop bool
 	// Upstream overrides Config.Upstream for this flow. Empty means the configured one.
 	Upstream string
+	// Host is the NAME the guest asked for, when the destination is one this caller invented (a fake
+	// address). It is sent to the proxy in place of the address, because a fake address exists nowhere
+	// and `UDP ASSOCIATE 198.18.7.3` would be a request for a host that cannot be reached.
+	//
+	// EMPTY MEANS "DIAL THE ADDRESS", which is every flow that was not invented: a guest resolving a
+	// real name gets a real address, and there is nothing to substitute.
+	Host string
 }
 
 // tunDevice is what the relay needs from a tun: packets in, packets out, and a close.
@@ -97,6 +104,11 @@ type key struct {
 	guestPort uint16
 	dstIP     [4]byte
 	dstPort   uint16
+	// host is the name a fake address stands for, and it is PART OF THE KEY: two guests (or one
+	// guest, twice) reaching the same fake address is one name, but a session must not be shared with
+	// a flow to the same address carrying a different name - which cannot happen with one caller, and
+	// is prevented here rather than assumed.
+	host string
 }
 
 type session struct {
@@ -355,7 +367,16 @@ func (r *Relay) forward(k key, payload []byte) error {
 	if route.Drop {
 		return nil
 	}
+	// THE NAME, WHEN THE CALLER NAMED ONE. A fake destination is an address this caller invented, so
+	// the only thing that can reach the real host is the name - and that name is also what the SOCKS5
+	// request sends.
+	if route.Host != "" {
+		k.host = route.Host
+	}
+
 	if route.Direct {
+		// A DIRECT FLOW WITH A NAME DIALS THE NAME, because a fake address leads nowhere and the
+		// caller told us what it stands for.
 		return r.forwardDirect(k, dstIP, payload)
 	}
 
@@ -373,7 +394,7 @@ func (r *Relay) forward(k key, payload []byte) error {
 	if err != nil {
 		return err
 	}
-	framed := socksUDPRequest(k.dstIP, k.dstPort, payload)
+	framed := socksUDPTarget(k.dstIP, k.dstPort, k.host, payload)
 	s.mu.Lock()
 	_, err = s.sock.WriteToUDP(framed, s.relay)
 	s.mu.Unlock()
@@ -388,7 +409,19 @@ func (r *Relay) forwardDirect(k key, dstIP net.IP, payload []byte) error {
 	r.mu.Lock()
 	existing, ok := r.sessions[k]
 	if !ok {
-		sock, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: dstIP, Port: int(k.dstPort)})
+		// A NAMED DIRECT FLOW DIALS THE NAME. The address in the packet is one the caller invented, so
+		// dialling it would send the datagram to an address that belongs to nothing.
+		addr := &net.UDPAddr{IP: dstIP, Port: int(k.dstPort)}
+		if k.host != "" {
+			resolved, err := net.ResolveUDPAddr("udp",
+				net.JoinHostPort(k.host, strconv.Itoa(int(k.dstPort))))
+			if err != nil {
+				r.mu.Unlock()
+				return err
+			}
+			addr = resolved
+		}
+		sock, err := net.DialUDP("udp", nil, addr)
 		if err != nil {
 			r.mu.Unlock()
 			return err
