@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/easydev-org/easytun"
@@ -71,6 +73,27 @@ func main() {
 		fail("starting the relay: %v", err)
 	}
 	defer func() { _ = r.Close() }()
+
+	// THE GUEST'S ADDRESS HAS TO EXIST BEFORE A SOCKET CAN USE IT AS A SOURCE.
+	//
+	// The policy rule in the relay matches `from <guest> ipproto udp`, so the test's socket must be
+	// bound to the guest's address - a socket from any other source would bypass the rule entirely.
+	// MEASURED on the first container run: without this line, `bind: cannot assign requested address`,
+	// because a fresh container namespace has no 172.30.0.2 on any interface.
+	//
+	// IT GOES ON `lo`, which is enough: the datagram is routed by the relay's policy rule before it
+	// ever reaches an interface, so where the address lives does not matter - only that it is local.
+	// `lo` MUST BE UP BEFORE AN ADDRESS ON IT IS USABLE. A fresh container namespace usually has it
+	// up already, but not always, and an address on a down interface accepts a bind and drops packets.
+	if out, err := exec.Command("ip", "link", "set", "lo", "up").CombinedOutput(); err != nil {
+		fail("raising lo: %v (%s)", err, out)
+	}
+	if out, err := exec.Command("ip", "addr", "add", guestIP+"/32", "dev", "lo").CombinedOutput(); err != nil {
+		// ALREADY PRESENT IS FINE: `Up` may have added it, or a previous run in this namespace.
+		if !strings.Contains(string(out), "File exists") {
+			fail("putting %s on lo: %v (%s)", guestIP, err, out)
+		}
+	}
 
 	// THE GUEST SOCKET. Its source address is the guest's, because the policy rule in the relay sends
 	// only THAT guest's UDP into the tun - a socket from any other address would bypass it.
