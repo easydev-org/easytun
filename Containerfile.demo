@@ -5,6 +5,11 @@
 # proxy, no DNS server, no sidecar.
 FROM golang:1.26-alpine AS build
 WORKDIR /src
+# THE MODULE PROXY, EXPLICITLY. MEASURED: without it the image's `go mod download` fell back to `direct`,
+# which needs `git` - and the alpine golang image has none, so the build failed with
+# `failed to execute git version: exec: "git": executable file not found in $PATH`. A proxy fetch needs
+# no git, which is what makes this image buildable from a bare toolchain.
+ENV GOPROXY=https://proxy.golang.org,direct
 # THE DEMO IS ITS OWN MODULE (testdata/container-demo), so it resolves easytun by its published tag -
 # which is what makes this image prove the version a caller actually gets. The library's root has no
 # go.sum because it has no dependencies, so only the demo's module files are copied here.
