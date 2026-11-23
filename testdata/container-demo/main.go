@@ -1,11 +1,17 @@
-// A CONTAINER THAT PROVES easytun's CONTAINER MODE WORKS FROM INSIDE.
+// A CONTAINER THAT PROVES easytun's CONTAINER MODE WORKS FROM INSIDE, INCLUDING EGRESS ROUTING.
 //
-// It runs as PID 1-ish in a container with /dev/net/tun and NET_ADMIN, takes over the namespace's
-// default route, makes the requests a workload would, and reports what happened on stdout so `kubectl
-// logs` is the evidence.
+// It runs in a container with /dev/net/tun and NET_ADMIN, takes over the namespace's default route,
+// makes the requests a workload would, and reports what happened on stdout so `kubectl logs` is the
+// evidence - and exits non-zero when any of it is wrong.
 //
-// THE REQUESTS ARE UDP AGAINST TEST-NET-3 ADDRESSES: reserved for documentation, so nothing real is at
-// one, and a reply can only have come from the tun side of this process.
+// TWO PROXIES AND TWO DESTINATIONS, because "a datagram came back" is not "the rule chose the path".
+// Each proxy tags its answer with its own letter, so the tag that arrives at the workload names the
+// path that carried it. The addresses are TEST-NET-3 (RFC 5737), reserved for documentation, so a reply
+// can only have come from a proxy this process can reach.
+//
+//	PROXY_A / PROXY_B    host:port of two SOCKS5 relays (the workflow starts them)
+//	                       unset: the demo uses a local echo server instead, which still exercises the
+//	                       tun, the mark and the reply rewrite but not the routing decision
 package main
 
 import (
@@ -25,29 +31,41 @@ func main() {
 		fmt.Printf("  (the demo will restore: %q)\n", strings.TrimSpace(string(out)))
 	}
 	show("ip route show default")
-	show("ip addr show")
 
-	// THE DEMO'S "INTERNET" IS A LOCAL ECHO SERVER, reachable only by the ORIGINAL route.
-	//
-	// It is what makes the measurement meaningful: the workload's datagrams are addressed to
-	// TEST-NET-3, so they can ONLY reach this server through the tun, and the server is on the
-	// pre-takeover path so it proves the exception route works. A real deployment replaces both with a
-	// SOCKS5 proxy and the real internet.
-	echoAddr, stopEcho := startEcho()
-	defer stopEcho()
-	fmt.Printf("the demo's echo server is on %s (reached by the original route)\n", echoAddr)
-	echoIP, _, _ := net.SplitHostPort(echoAddr)
+	proxyA, proxyB := os.Getenv("PROXY_A"), os.Getenv("PROXY_B")
+
+	// THE FALLBACK: no proxies configured, so a local echo server stands in for the internet. It still
+	// proves the tun carries a datagram and the reply reaches the workload; it cannot prove routing.
+	var fallbackAddr string
+	var stopFallback func()
+	if proxyA == "" || proxyB == "" {
+		fallbackAddr, stopFallback = startEcho()
+		defer stopFallback()
+		fmt.Printf("no PROXY_A/PROXY_B set, so a local echo server on %s stands in\n", fallbackAddr)
+	}
 
 	c, err := easytun.StartContainer(easytun.ContainerConfig{
 		Name: "et0",
-		// THE EXCEPTION IS WHAT LETS THE PROCESS REACH THE ECHO SERVER, exactly as it lets a real
-		// deployment reach its proxy.
-		Exempt: []string{echoIP},
-		// A DIRECT RULE for everything: the datagram leaves this process unproxied, which is the
-		// simplest path that still exercises the tun, the mark and the reply rewrite. The address is
-		// rewritten to the echo server's, so a datagram addressed to TEST-NET-3 lands there.
+		// THE PROXIES ARE EXEMPT, or the relay's own connections to them loop back into its device.
+		// StartContainer exempts `Upstream` automatically; the second proxy is named here because it is
+		// only reachable by the original route too.
+		Exempt:   exemptHosts(proxyA, proxyB, fallbackAddr),
+		Upstream: proxyA,
 		Route: func(dst net.IP, port uint16) easytun.Route {
-			return easytun.Route{Direct: true, Host: echoAddr}
+			switch {
+			case proxyA != "" && dst.String() == "203.0.113.10":
+				return easytun.Route{Upstream: proxyA}
+			case proxyB != "" && dst.String() == "203.0.113.20":
+				return easytun.Route{Upstream: proxyB}
+			case proxyA != "" && dst.String() == "203.0.113.40":
+				// A DROPPED DESTINATION: the rule says no, so nothing goes anywhere.
+				return easytun.Route{Kind: easytun.RouteDrop}
+			case fallbackAddr != "":
+				// THE FALLBACK MODE: everything goes to the echo server, rewritten, so a reply proves
+				// the tun carried the datagram in both directions.
+				return easytun.Route{Direct: true, Host: fallbackAddr}
+			}
+			return easytun.Route{}
 		},
 		Logf: func(f string, a ...any) { fmt.Printf("  easytun: "+f+"\n", a...) },
 	})
@@ -69,30 +87,36 @@ func main() {
 	defer client.Close()
 
 	fail := false
-	for _, target := range []string{"203.0.113.10:443", "203.0.113.20:53"} {
-		addr, _ := net.ResolveUDPAddr("udp4", target)
-		if _, err := client.WriteToUDP([]byte("from-the-workload"), addr); err != nil {
-			fmt.Printf("FAIL %s: %v\n", target, err)
+	expect := func(addr, want string) {
+		got := ask(client, addr, 3*time.Second)
+		if got != want {
+			fmt.Printf("FAIL %-18s -> %q, want %q\n", addr, got, want)
 			fail = true
-			continue
+			return
 		}
-		client.SetReadDeadline(time.Now().Add(3 * time.Second))
-		buf := make([]byte, 1024)
-		if n, from, err := client.ReadFromUDP(buf); err == nil {
-			fmt.Printf("ok   %s -> %q from %v\n", target, buf[:n], from)
-		} else {
-			fmt.Printf("FAIL %s: the datagram did not come back through the device: %v\n", target, err)
+		fmt.Printf("ok   %-18s -> %q\n", addr, got)
+	}
+	silent := func(addr string) {
+		if got := ask(client, addr, 900*time.Millisecond); got != "" {
+			fmt.Printf("FAIL %-18s -> %q, want silence\n", addr, got)
 			fail = true
+			return
 		}
+		fmt.Printf("ok   %-18s -> (silence)\n", addr)
 	}
 
-	// THE ROUTE COMES BACK, which is the property that makes this safe to run in a container that does
-	// anything else afterwards.
-	// A DEGRADED RESTORE IS NOT A FAILURE OF THE MODE. If the namespace's original gateway was on a
-	// link that no longer reaches anything - which is what a test fixture with a dead peer looks like,
-	// and what a container whose interface went away looks like - Close reports it and puts back the
-	// device-only form so there is still a default route. That is the right behaviour and the demo
-	// treats it as a warning.
+	if proxyA != "" && proxyB != "" {
+		// THE ROUTING CLAIM: the letter that comes back names the path, and A's destination must NOT
+		// answer with B's letter (that cross-check is what makes the first assertion mean something).
+		expect("203.0.113.10:443", "A:udp-from-the-workload")
+		expect("203.0.113.20:443", "B:udp-from-the-workload")
+		silent("203.0.113.40:443")
+	} else {
+		expect("203.0.113.10:443", "echo:udp-from-the-workload")
+		expect("203.0.113.20:53", "echo:udp-from-the-workload")
+	}
+
+	// THE ROUTE COMES BACK, which is what makes this safe in a container that does anything afterwards.
 	if err := c.Close(); err != nil {
 		if strings.Contains(err.Error(), "could not be restored exactly") {
 			fmt.Printf("warn Close: %v\n", err)
@@ -103,13 +127,7 @@ func main() {
 	}
 	fmt.Println("=== after Close ===")
 	show("ip route show default")
-	// "RESTORED" MEANS THERE IS ONE, NOT MERELY THAT IT IS NOT THE DEVICE.
-	//
-	// MEASURED: the first version of this check only tested `not et0`, so an EMPTY default route - the
-	// namespace with no way out at all - printed `ok`. That is the failure the restore exists to
-	// prevent, reported as a success.
-	out, _ := exec.Command("ip", "route", "show", "default").Output()
-	switch {
+	switch out, _ := exec.Command("ip", "route", "show", "default").Output(); {
 	case strings.Contains(string(out), "et0"):
 		fmt.Println("FAIL: the default route still points at the device after Close")
 		fail = true
@@ -125,6 +143,38 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("RESULT: container mode works")
+}
+
+// ask sends one datagram and returns the reply, or "" when none arrives inside the window.
+func ask(client *net.UDPConn, addr string, wait time.Duration) string {
+	u, err := net.ResolveUDPAddr("udp4", addr)
+	if err != nil {
+		return "<bad address: " + err.Error() + ">"
+	}
+	if _, err := client.WriteToUDP([]byte("udp-from-the-workload"), u); err != nil {
+		return "<write failed: " + err.Error() + ">"
+	}
+	_ = client.SetReadDeadline(time.Now().Add(wait))
+	buf := make([]byte, 2048)
+	n, _, err := client.ReadFromUDP(buf)
+	if err != nil {
+		return ""
+	}
+	return string(buf[:n])
+}
+
+// exemptHosts collects the addresses the process must still reach by the original route.
+func exemptHosts(addrs ...string) []string {
+	var out []string
+	for _, a := range addrs {
+		if a == "" {
+			continue
+		}
+		if host, _, err := net.SplitHostPort(a); err == nil && host != "" {
+			out = append(out, host)
+		}
+	}
+	return out
 }
 
 // startEcho answers every datagram with "echo:" and the payload, on the pre-takeover path.

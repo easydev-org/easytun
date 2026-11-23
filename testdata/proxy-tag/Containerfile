@@ -1,0 +1,9 @@
+# THE TAGGING SOCKS5 PROXY, AS AN IMAGE, so the demo's Kubernetes job can run two of them.
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY testdata/proxy-tag/ ./
+RUN CGO_ENABLED=0 go build -o /out/proxy-tag .
+
+FROM alpine:3.21
+COPY --from=build /out/proxy-tag /usr/local/bin/proxy-tag
+ENTRYPOINT ["/usr/local/bin/proxy-tag"]

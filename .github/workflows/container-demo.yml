@@ -1,36 +1,24 @@
 name: container-demo
 
-# BUILD THE CONTAINER-MODE DEMO, THEN RUN IT IN A REAL POD AND READ THE EVIDENCE FROM ITS LOG.
+# A REAL CLUSTER, ON THE RUNNER, SO THIS JOB ACTUALLY RUNS.
 #
-# THIS IS THE TEST THAT ANSWERS "does it work in a container", and nothing about it is simulated:
+# THE PREVIOUS VERSION OF THIS FILE HAD `if: vars.KUBE_CONTEXT != ''`, WHICH WAS ALWAYS FALSE - so the
+# pod job never ran anywhere, and the whole container mode was verified by hand on one cluster and
+# never again. That is the failure this rewrite fixes: a test that is skipped by default is not a test.
 #
-#	build the image in Actions, push it to ghcr
-#	start a pod from that image with /dev/net/tun and NET_ADMIN
-#	the pod takes over its own default route, makes UDP requests, and prints what happened
-#	the job asserts on THAT LOG, not on an exit code alone
+# SO THE CLUSTER IS PART OF THE JOB. `kind` creates a single-node cluster on the runner in about a
+# minute, the image is loaded into it directly (no registry pull, no credentials), and the pod runs with
+# the two things container mode needs: /dev/net/tun and NET_ADMIN.
 #
-# WHY A POD AND NOT A LOCAL `docker run`: the point is the container's OWN network namespace, and a pod
-# is the smallest thing with one that a cluster gives. It also proves the capability and device
-# requirements are right, because a pod without them fails at `Preflight` with a sentence.
-#
-# THE CLUSTER IS OPTIONAL. `push` always runs and proves the image builds; `pod` runs only where
-# KUBECONFIG is provided, because a GitHub runner has no cluster and a workflow that assumed one would
-# be red for everybody.
+# WHAT THE POD PROVES, AND THE WORKLOAD IS THE WITNESS: it takes over its own namespace's default route,
+# sends UDP to two destinations, and each answer comes back TAGGED WITH THE PROXY THAT CARRIED IT. The
+# job asserts on the tags AND on the proxies' own logs, so "the rule chose the path" is checked from
+# both sides - and a bug that sent everything to A would pass the first check and fail the second.
 
 on:
   push:
     branches: ["**"]
-    paths:
-      - "Containerfile.demo"
-      - "testdata/container-demo/**"
-      - ".github/workflows/container-demo.yml"
-      - "*.go"
-      - "go.mod"
   pull_request:
-    paths:
-      - "Containerfile.demo"
-      - "testdata/container-demo/**"
-      - ".github/workflows/container-demo.yml"
   workflow_dispatch:
 
 concurrency:
@@ -38,161 +26,199 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}/container-demo
+  IMAGE: easytun-container-demo
 
 jobs:
-  image:
-    name: build and push the demo image
+  demo:
+    name: container mode, in a real pod
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      image: ${{ steps.build.outputs.image }}
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
 
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
+      - uses: actions/setup-go@v7
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          go-version: "1.26"
+          cache: false
 
-      - name: build
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Containerfile.demo
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ env.IMAGE }}:${{ github.sha }}
-            ${{ env.IMAGE }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      # THE IMAGE MUST CARRY REAL iproute2. MEASURED: alpine's busybox `ip` cannot do `rule ipproto`,
-      # and the container mode needs that for the guest-scoped policy. A build that silently shipped
-      # busybox would fail in the pod with a message about `ipproto`, three layers from the cause.
-      - name: the image has real iproute2, not busybox
+      # THE IMAGE IS BUILT HERE AND LOADED, NOT PUSHED. A registry pull would add a credential, a
+      # propagation delay and a second source of truth about which bytes ran; `kind load` puts the
+      # exact image this run built into the cluster.
+      - name: build the demo image
         run: |
           set -eux
-          docker run --rm --entrypoint /bin/sh "${{ env.IMAGE }}:${{ github.sha }}" -c '
-            set -eux
-            ip -V
-            # busybox prints "BusyBox v..." and has no `-V`; iproute2 prints "ip utility".
+          docker build -f Containerfile.demo -t "$IMAGE:${GITHUB_SHA}" .
+
+      - name: the image has real iproute2, not busybox
+        # MEASURED: alpine's busybox `ip` cannot do `rule ... ipproto` or `fwmark`, and the container mode
+        # needs both. A build that shipped busybox would fail in the pod with a message about `ipproto`,
+        # three layers from the cause.
+        run: |
+          set -eux
+          docker run --rm --entrypoint /bin/sh "$IMAGE:${GITHUB_SHA}" -c '
             ip -V | grep -q "ip utility"
             command -v ip
           '
 
-  pod:
-    name: run it in a pod and assert on the log
-    needs: image
-    # ONLY WHERE A CLUSTER IS PROVIDED. A runner has none, and a workflow that required one would be
-    # red for every fork and every local run of `act`.
-    if: ${{ vars.KUBE_CONTEXT != '' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
+      - name: a cluster on the runner
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: easytun
+          # THE NODE NEEDS THE DEVICE TOO, because the pod's /dev/net/tun comes from the node's. A
+          # hostPath mount of a missing device gives an empty directory, and the pod fails at
+          # StartContainer with a message that says the device is unusable - which is why the node has
+          # one: every Linux kernel has the tun module.
+          node_image: kindest/node:v1.31.0
 
-      - name: kubectl
-        uses: azure/setup-kubectl@v4
-
-      - name: the cluster's credentials
+      - name: the node has /dev/net/tun
         run: |
           set -eux
-          mkdir -p "$HOME/.kube"
-          printf '%s' "${{ secrets.KUBE_CONFIG }}" > "$HOME/.kube/config"
-          chmod 600 "$HOME/.kube/config"
-          kubectl config use-context "${{ vars.KUBE_CONTEXT }}"
-          kubectl version --output=yaml | head -5
+          docker exec easytun-control-plane sh -c 'ls -l /dev/net/tun || mknod /dev/net/tun c 10 200'
+          docker exec easytun-control-plane ls -l /dev/net/tun
 
-      - name: start the pod
+      - name: load the image into the cluster
         run: |
           set -eux
-          # THE IMAGE IS PULLED FROM GHCR, so the pod runs exactly the bytes this run built. A
-          # `:latest` would be whatever was pushed last, which is the drift this avoids.
-          cat > /tmp/pod.yaml <<'YAML'
+          kind load docker-image "$IMAGE:${GITHUB_SHA}" --name easytun
+          kubectl get nodes -o wide
+
+      # THE TWO PROXIES ARE PODS IN THE SAME CLUSTER, on their own addresses, so the relay reaches them
+      # by the original route - which is exactly what exercises the exception route.
+      - name: two proxies that tag their answers
+        run: |
+          set -eux
+          # A SECOND IMAGE, BUILT FROM THIS REPOSITORY: the proxy is 200 lines of Go, and an image is
+          # simpler than a ConfigMap plus an interpreter on the node.
+          docker build -f testdata/proxy-tag/Containerfile -t easytun-proxy-tag:test .
+          kind load docker-image easytun-proxy-tag:test --name easytun
+
+          kubectl apply -f - <<'YAML'
           apiVersion: v1
           kind: Pod
           metadata:
-            name: easytun-container-demo
+            name: proxy-a
+            labels: {app: proxy, tag: a}
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: p
+                image: easytun-proxy-tag:test
+                imagePullPolicy: Never
+                args: ["--port", "1080", "--tag", "A", "--log", "/tmp/a.log"]
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: proxy-b
+            labels: {app: proxy, tag: b}
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: p
+                image: easytun-proxy-tag:test
+                imagePullPolicy: Never
+                args: ["--port", "1081", "--tag", "B", "--log", "/tmp/b.log"]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: proxy-a
+          spec:
+            selector: {app: proxy, tag: a}
+            ports: [{port: 1080, targetPort: 1080}]
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: proxy-b
+          spec:
+            selector: {app: proxy, tag: b}
+            ports: [{port: 1081, targetPort: 1081}]
+          YAML
+          kubectl wait --for=condition=Ready pod/proxy-a pod/proxy-b --timeout=120s
+          kubectl get pods,svc
+
+      - name: the demo pod, with a device and the capability
+        run: |
+          set -eux
+          kubectl apply -f - <<YAML
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: demo
           spec:
             restartPolicy: Never
             containers:
               - name: demo
-                image: IMAGE_TAG
-                # THE TWO THINGS CONTAINER MODE NEEDS, and nothing else. A pod without them fails at
-                # Preflight with a sentence that names which one is missing.
+                image: ${IMAGE}:${GITHUB_SHA}
+                imagePullPolicy: Never
+                env:
+                  - {name: PROXY_A, value: "proxy-a:1080"}
+                  - {name: PROXY_B, value: "proxy-b:1081"}
                 securityContext:
                   capabilities:
                     add: ["NET_ADMIN"]
-                volumeDevices: []
-                # /dev/net/tun IS A HOST DEVICE, not a volume: a pod asks for it this way, and the
-                # device plugin is not needed because it exists on every Linux node.
-          YAML
-          # the device is requested through a hostPath, which is how a pod gets /dev/net/tun
-          python3 - <<'PY'
-          import pathlib
-          p = pathlib.Path("/tmp/pod.yaml")
-          s = p.read_text()
-          s = s.replace("IMAGE_TAG", "${{ needs.image.outputs.image }}:${{ github.sha }}")
-          s = s.replace("                volumeDevices: []\n", """                volumeMounts:
-                  - name: dev
-                    mountPath: /dev/net
-                    readOnly: false
+                volumeMounts:
+                  - {name: dev, mountPath: /dev/net}
             volumes:
               - name: dev
-                hostPath:
-                  path: /dev/net
-                  type: Directory
-          """)
-          p.write_text(s)
-          PY
-          cat /tmp/pod.yaml
-          kubectl apply -f /tmp/pod.yaml
-
-      - name: wait for it to finish, and read the log
-        run: |
-          set -eux
-          # A BOUNDED WAIT, NOT A SLEEP: `wait` watches the phase and returns when it leaves Pending or
-          # Running. The timeout is generous because the first pull of a new image on a cold node is
-          # the slow part.
-          kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/easytun-container-demo \
-            --timeout=180s || true
+                hostPath: {path: /dev/net, type: Directory}
+          YAML
+          # A BOUNDED WAIT, NOT A SLEEP: it returns when the phase leaves Running.
+          kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/demo --timeout=180s || true
           echo "=== phase ==="
-          kubectl get pod easytun-container-demo -o jsonpath='{.status.phase}{"\n"}' || true
+          kubectl get pod demo -o jsonpath='{.status.phase}{"\n"}' || true
           echo "=== log ==="
-          kubectl logs easytun-container-demo | tee /tmp/demo.log || true
+          kubectl logs demo | tee /tmp/demo.log || true
           echo "=== describe, if it did not run ==="
-          kubectl describe pod easytun-container-demo | tail -30 || true
+          kubectl describe pod demo | tail -25 || true
 
       - name: assert on what the pod printed
         run: |
           set -eux
           L=$(cat /tmp/demo.log 2>/dev/null || true)
-          fail() { echo "::error::$*"; exit 1; }
+          fail() { echo "::error::$1"; exit 1; }
 
-          # THE MODE STARTED. A failure here is the device or the capability, and the pod's own log
-          # says which because Preflight names it.
-          case "$L" in *"StartContainer:"*) fail "the pod could not start container mode; its log names why" ;; esac
-          case "$L" in *"the default route now points into"*) ;; *) fail "the pod never took over its default route" ;; esac
+          # THE MODE STARTED. A failure here is the device or the capability, and the pod's log names
+          # which because StartContainer refuses with a sentence.
+          case "$L" in *"StartContainer:"*) fail "the pod could not start container mode; see its log" ;; esac
+          case "$L" in *"the default route now points into"*) ;; *) fail "the pod never took over its route" ;; esac
 
-          # THE WORKLOAD'S DATAGRAMS CAME BACK THROUGH THE DEVICE, which is the claim.
-          case "$L" in *"FAIL"*) fail "a request failed; the log above says which" ;; esac
-          [ "$(printf '%s' "$L" | grep -c '^ok   ')" -ge 2 ] || fail "fewer than two requests succeeded"
+          # EACH DESTINATION TOOK ITS OWN PATH: the tag names the proxy, so A's answer cannot be B's.
+          case "$L" in *'203.0.113.10:443   -> "A:udp-from-the-workload"'*) ;; *) fail "the primary destination was not carried by proxy A" ;; esac
+          case "$L" in *'203.0.113.20:443   -> "B:udp-from-the-workload"'*) ;; *) fail "the backup destination was not carried by proxy B" ;; esac
+          # AND THE DROPPED ONE REACHED NOBODY.
+          case "$L" in *'203.0.113.40:443   -> (silence)'*) ;; *) fail "a dropped destination was answered" ;; esac
 
-          # AND THE ROUTE WAS RESTORED, so the container is not left unable to reach anything.
-          case "$L" in *"ok   the default route is restored"*) ;; *) fail "the default route was not restored after Close" ;; esac
+          # THE ROUTE CAME BACK, so the container is not left unable to reach anything.
+          case "$L" in *"ok   the default route is restored"*) ;; *) fail "the default route was not restored" ;; esac
           case "$L" in *"RESULT: container mode works"*) ;; *) fail "the pod did not reach its success line" ;; esac
+          echo "container mode works in a pod, and each destination took its own path"
 
-          echo "container mode works in a pod"
+      # THE PROXIES' OWN LOGS, FROM OUTSIDE THE CONTAINER. A bug that forged the tags would have to forge
+      # these too, in a different process - and this is also the check that A did not carry B's traffic.
+      - name: assert on what each proxy CARRIED
+        run: |
+          set -eux
+          A=$(kubectl exec proxy-a -- cat /tmp/a.log 2>/dev/null || true)
+          B=$(kubectl exec proxy-b -- cat /tmp/b.log 2>/dev/null || true)
+          echo "=== proxy A carried ==="; printf '%s\n' "$A"
+          echo "=== proxy B carried ==="; printf '%s\n' "$B"
+          fail() { echo "::error::$1"; exit 1; }
 
-      - name: clean up
+          case "$A" in *"203.0.113.10"*) ;; *) fail "proxy A never carried the primary destination" ;; esac
+          case "$B" in *"203.0.113.20"*) ;; *) fail "proxy B never carried the backup destination" ;; esac
+          # THE CROSS-CHECKS: without these, "everything went to A" would pass the two above.
+          case "$B" in *"203.0.113.10"*) fail "the primary destination was carried by BACKUP as well" ;; esac
+          case "$A" in *"203.0.113.20"*) fail "the backup destination was carried by PRIMARY as well" ;; esac
+          # AND THE DROPPED ONE REACHED NO PROXY.
+          case "$A$B" in *"203.0.113.40"*) fail "a dropped destination reached a proxy" ;; esac
+
+      - name: always, everything
         if: always()
-        run: kubectl delete pod easytun-container-demo --ignore-not-found || true
+        run: |
+          kubectl get pods -o wide 2>/dev/null || true
+          for p in demo proxy-a proxy-b; do
+            echo "=== $p ==="; kubectl logs "$p" 2>/dev/null | tail -25 || true
+          done
+          kubectl describe pod demo 2>/dev/null | tail -30 || true

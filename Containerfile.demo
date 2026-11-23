@@ -13,9 +13,9 @@ WORKDIR /src
 # happened to be.
 COPY . /src
 
-# THE DEMO'S GO.MOD POINTS AT THE LIBRARY BY A RELATIVE PATH, which is what a module inside this
-# repository should do; a published tag is what an OUTSIDE caller uses, and that path is covered by the
-# egress job.
+# THE DEMO'S GO.MOD POINTS AT THE LIBRARY BY A RELATIVE PATH when built from a checkout, which is what
+# a module inside this repository should do; a published tag is what an OUTSIDE caller uses, and that
+# path is covered by the egress job.
 RUN cd testdata/container-demo && \
     go mod edit -replace github.com/easydev-org/easytun=/src && \
     go mod tidy && \
