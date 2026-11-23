@@ -219,3 +219,56 @@ func TestAHostnameUpstreamIsResolvedForItsException(t *testing.T) {
 }
 
 var _ = net.IPv4
+
+// THE MARK IS WHAT BREAKS THE LOOP, and it is the one thing the routing tests above cannot show:
+// without it, the relay's own socket is routed into the relay's own device.
+//
+// THIS ASSERTS THE SHAPE - a rule exists for the mark, before the takeover - because the effect needs a
+// real namespace, and `TestE2EContainerTakesOver` measures the effect where one is available.
+func TestTheMarkRulesAreInstalledAndRemoved(t *testing.T) {
+	var log routeLog
+	log.install(t, "default via 172.17.0.1 dev eth0\n")
+	oldOpen, oldUp, oldRemove := openDevice, bringUp, removeDevice
+	defer func() { openDevice, bringUp, removeDevice = oldOpen, oldUp, oldRemove }()
+	openDevice = func(string) (tunDevice, error) { return newPipeline(), nil }
+	bringUp = func(string, string) error { return nil }
+	removeDevice = func(string) error { return nil }
+
+	c, err := StartContainer(ContainerConfig{Name: "mk0"})
+	if err != nil {
+		t.Fatalf("StartContainer: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	var sawAdd, sawDel bool
+	for _, cmd := range log.cmds {
+		if strings.Contains(cmd, "rule add fwmark 0x1 lookup 100") {
+			sawAdd = true
+		}
+		if strings.Contains(cmd, "rule del fwmark 0x1 lookup 100") {
+			sawDel = true
+		}
+	}
+	if !sawAdd {
+		t.Fatalf("no mark rule was installed, so the relay's own traffic would loop:\n%s",
+			strings.Join(log.cmds, "\n"))
+	}
+	if !sawDel {
+		t.Fatalf("the mark rule was not removed, so a second run would accumulate rules:\n%s",
+			strings.Join(log.cmds, "\n"))
+	}
+	// AND THE ORIGINAL DEFAULT WENT INTO THE TABLE THE MARK POINTS AT, which is what makes the rule
+	// mean something after `main` has been taken over.
+	found := false
+	for _, cmd := range log.cmds {
+		if strings.Contains(cmd, "route replace default via 172.17.0.1 dev eth0 table 100") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the original default was not saved into table 100, so a marked socket would "+
+			"still find the tun:\n%s", strings.Join(log.cmds, "\n"))
+	}
+}

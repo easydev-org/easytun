@@ -478,21 +478,36 @@ func (r *Relay) forwardDirect(k key, dstIP net.IP, payload []byte) error {
 	if !ok {
 		// A NAMED DIRECT FLOW DIALS THE NAME. The address in the packet is one the caller invented, so
 		// dialling it would send the datagram to an address that belongs to nothing.
+		//
+		// `Host` MAY CARRY ITS OWN PORT - "127.0.0.1:5353" - AND THAT PORT WINS, because a caller that
+		// wrote one meant it: a test or a redirect target is at a specific port, and the destination
+		// port in the datagram is the one the WORKLOAD chose, which is not where such a target listens.
+		// MEASURED while writing the container demo: passing "127.0.0.1:40704" to JoinHostPort produced
+		// "127.0.0.1:40704:443", and the resolver answered `no such host`.
 		addr := &net.UDPAddr{IP: dstIP, Port: int(k.dstPort)}
 		if k.host != "" {
-			resolved, err := net.ResolveUDPAddr("udp",
-				net.JoinHostPort(k.host, strconv.Itoa(int(k.dstPort))))
+			target := k.host
+			if _, _, err := net.SplitHostPort(target); err == nil {
+				// it already has a port
+			} else {
+				target = net.JoinHostPort(target, strconv.Itoa(int(k.dstPort)))
+			}
+			resolved, err := net.ResolveUDPAddr("udp", target)
 			if err != nil {
 				r.mu.Unlock()
 				return err
 			}
 			addr = resolved
 		}
-		sock, err := net.DialUDP("udp", nil, addr)
+		// THE MARK IS WHAT KEEPS THIS OUT OF THE TUN. A direct datagram goes to a real host, so its
+		// socket must take the original route - without the mark it enters the relay's own device and
+		// never leaves. See mark.go.
+		conn, err := r.dialer().Dial("udp", addr.String())
 		if err != nil {
 			r.mu.Unlock()
 			return err
 		}
+		sock := conn.(*net.UDPConn)
 		existing = &session{sock: sock, last: time.Now(), direct: true}
 		r.sessions[k] = existing
 		go r.drainDirect(k, existing)
@@ -683,7 +698,9 @@ func newSession(upstream string) (*session, error) {
 			relayAddr = a
 		}
 	}
-	sock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	// MARKED, BECAUSE THIS SOCKET'S PACKETS GO TO THE PROXY - and in container mode the proxy is only
+	// reachable by the original route. An unmarked socket would send the framed request into the tun.
+	sock, err := listenMarked()
 	if err != nil {
 		ctl.Close()
 		return nil, err

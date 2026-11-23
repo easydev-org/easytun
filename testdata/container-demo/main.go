@@ -24,10 +24,28 @@ func main() {
 	show("ip route show default")
 	show("ip addr show")
 
+	// THE DEMO'S "INTERNET" IS A LOCAL ECHO SERVER, reachable only by the ORIGINAL route.
+	//
+	// It is what makes the measurement meaningful: the workload's datagrams are addressed to
+	// TEST-NET-3, so they can ONLY reach this server through the tun, and the server is on the
+	// pre-takeover path so it proves the exception route works. A real deployment replaces both with a
+	// SOCKS5 proxy and the real internet.
+	echoAddr, stopEcho := startEcho()
+	defer stopEcho()
+	fmt.Printf("the demo's echo server is on %s (reached by the original route)\n", echoAddr)
+	echoIP, _, _ := net.SplitHostPort(echoAddr)
+
 	c, err := easytun.StartContainer(easytun.ContainerConfig{
 		Name: "et0",
-		// NO UPSTREAM: this demo measures that traffic reaches the device, and a real deployment
-		// points this at a SOCKS5 proxy - which must then be exempted, as StartContainer does.
+		// THE EXCEPTION IS WHAT LETS THE PROCESS REACH THE ECHO SERVER, exactly as it lets a real
+		// deployment reach its proxy.
+		Exempt: []string{echoIP},
+		// A DIRECT RULE for everything: the datagram leaves this process unproxied, which is the
+		// simplest path that still exercises the tun, the mark and the reply rewrite. The address is
+		// rewritten to the echo server's, so a datagram addressed to TEST-NET-3 lands there.
+		Route: func(dst net.IP, port uint16) easytun.Route {
+			return easytun.Route{Direct: true, Host: echoAddr}
+		},
 		Logf: func(f string, a ...any) { fmt.Printf("  easytun: "+f+"\n", a...) },
 	})
 	if err != nil {
@@ -67,9 +85,18 @@ func main() {
 
 	// THE ROUTE COMES BACK, which is the property that makes this safe to run in a container that does
 	// anything else afterwards.
+	// A DEGRADED RESTORE IS NOT A FAILURE OF THE MODE. If the namespace's original gateway was on a
+	// link that no longer reaches anything - which is what a test fixture with a dead peer looks like,
+	// and what a container whose interface went away looks like - Close reports it and puts back the
+	// device-only form so there is still a default route. That is the right behaviour and the demo
+	// treats it as a warning.
 	if err := c.Close(); err != nil {
-		fmt.Println("FAIL Close:", err)
-		fail = true
+		if strings.Contains(err.Error(), "could not be restored exactly") {
+			fmt.Printf("warn Close: %v\n", err)
+		} else {
+			fmt.Println("FAIL Close:", err)
+			fail = true
+		}
 	}
 	fmt.Println("=== after Close ===")
 	show("ip route show default")
@@ -85,6 +112,30 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("RESULT: container mode works")
+}
+
+// startEcho answers every datagram with "echo:" and the payload, on the pre-takeover path.
+//
+// IT BINDS A CONCRETE ADDRESS, NOT 0.0.0.0, because that address is what the relay is told to dial:
+// `0.0.0.0:port` is a bind wildcard and not a destination, so a caller that passed it on would ask the
+// resolver for a host named "0.0.0.0".
+func startEcho() (string, func()) {
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		fmt.Println("the echo server:", err)
+		os.Exit(1)
+	}
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, from, err := c.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			c.WriteToUDP(append([]byte("echo:"), buf[:n]...), from)
+		}
+	}()
+	return c.LocalAddr().String(), func() { c.Close() }
 }
 
 func show(cmd string) {

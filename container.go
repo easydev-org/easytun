@@ -38,6 +38,7 @@ package easytun
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 )
 
@@ -86,6 +87,12 @@ type Container struct {
 	logf   func(string, ...any)
 	once   bool
 }
+
+// originalTable is where the pre-takeover default route is kept, so a marked socket can still use it
+// after `main` has been taken over. `100` is above the kernel's reserved tables (0, 253, 254, 255) and
+// below nothing this package uses for a guest relay (which starts at 100 too, but in a different
+// namespace - a container has one relay and one table).
+const originalTable = 100
 
 // defaultRoute is what the namespace's default route looked like before the takeover.
 type defaultRoute struct {
@@ -156,11 +163,49 @@ func StartContainer(cfg ContainerConfig) (*Container, error) {
 	}
 
 	// 3. THE TAKEOVER.
+	//
+	// THE OLD DEFAULT ROUTE MUST GO, NOT JUST BE OUTRANKED. MEASURED: installing a second default with
+	// a higher metric leaves TWO, and the kernel picks the lower metric - so the packets went out the
+	// original way and the device saw nothing, while `ip route show default` looked like the takeover
+	// had happened. A metric that merely loses is the failure that reads as a working setup.
 	if out, err := run("ip", "route", "replace", "default", "dev", name, "metric", "100"); err != nil {
 		_ = tun.Close()
 		_ = deleteTun(name)
 		return nil, fmt.Errorf("moving the default route into %s: %v (%s)", name, err, firstLine(out))
 	}
+	// THE ORIGINAL DEFAULT MOVES INTO ITS OWN TABLE, RATHER THAN BEING DELETED.
+	//
+	// THIS IS WHAT MAKES THE MARK WORK. A marked socket does `lookup main`, and if the takeover simply
+	// REPLACED the default route then `main` no longer holds the original - so the marked packet finds
+	// the tun too and the loop is unchanged. Keeping the old default in `originalTable` and pointing the
+	// mark at THAT is what gives the relay its own way out.
+	//
+	//	ip route replace default via <gw> dev <iface> table <originalTable>
+	//	ip rule add fwmark 0x1 lookup <originalTable> pref 100
+	//
+	// and then the takeover replaces the default in `main` freely.
+	origArgs := []string{"route", "replace", "default"}
+	if c.before.via != "" {
+		origArgs = append(origArgs, "via", c.before.via)
+	}
+	origArgs = append(origArgs, "dev", c.before.dev, "table", strconv.Itoa(originalTable))
+	if out, err := run("ip", origArgs...); err != nil {
+		_ = tun.Close()
+		_ = deleteTun(name)
+		return nil, fmt.Errorf("saving the original default route: %v (%s)", err, firstLine(out))
+	}
+	// AND THE MARK POINTS AT IT. This replaces installMarkRules' `lookup main`, because `main` is
+	// about to hold the tun's default.
+	if err := installMarkRules(relayMark, originalTable); err != nil {
+		_ = tun.Close()
+		_ = deleteTun(name)
+		return nil, err
+	}
+	// THE OLD DEFAULT IS REMOVED FROM `main`, by its exact form, so nothing else is touched.
+	if c.before.via != "" {
+		_, _ = run("ip", "route", "del", "default", "via", c.before.via, "dev", c.before.dev)
+	}
+	_, _ = run("ip", "route", "del", "default", "dev", c.before.dev)
 
 	// THE RELAY BEHIND IT. No policy routing: the device is the default route, so every datagram this
 	// namespace sends is already here.
@@ -213,10 +258,28 @@ func (c *Container) Close() error {
 		args = append(args, "dev", c.before.dev)
 	}
 	if out, err := run("ip", args...); err != nil {
-		problems = append(problems, fmt.Sprintf("restoring the default route (%s): %v (%s)",
-			strings.Join(args, " "), err, firstLine(out)))
+		// THE GATEWAY CAN BE UNREACHABLE FOR A REASON THAT IS NOT A BUG IN THIS CODE - the route was
+		// recorded on a link that has since gone, which is what a test fixture with a dead peer looks
+		// like. The DEVICE-ONLY form is tried as a last resort, because a namespace with NO default
+		// route can reach nothing at all, and that is worse than one that routes to a link with no peer.
+		//
+		// A GATEWAY-LESS DEFAULT CAN HIJACK LOOPBACK (measured), so this is a LAST resort and the
+		// original failure is still reported: the caller learns both that the exact route could not be
+		// rebuilt and what was put in its place.
+		fallback := []string{"route", "replace", "default", "dev", c.before.dev}
+		if out2, err2 := run("ip", fallback...); err2 != nil {
+			problems = append(problems, fmt.Sprintf("restoring the default route (%s): %v (%s); the "+
+				"fallback (%s) also failed: %v (%s)", strings.Join(args, " "), err, firstLine(out),
+				strings.Join(fallback, " "), err2, firstLine(out2)))
+		} else {
+			problems = append(problems, fmt.Sprintf("the default route could not be restored exactly "+
+				"(%v: %s), so it points at %s with no gateway; check whether that link reaches anything",
+				err, firstLine(out), c.before.dev))
+		}
 	}
 
+	removeMarkRules(relayMark, originalTable)
+	_, _ = run("ip", "route", "flush", "table", strconv.Itoa(originalTable))
 	for _, host := range c.exempt {
 		if out, err := run("ip", "route", "del", host+"/32"); err != nil && !contains(out, "No such process") {
 			problems = append(problems, fmt.Sprintf("removing the exception for %s: %v (%s)",

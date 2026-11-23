@@ -3,6 +3,7 @@ package easytun
 import (
 	"encoding/binary"
 	"net"
+	"strconv"
 )
 
 // THE PACKET LAYER: BUILD AN IPv4+UDP DATAGRAM, AND STRIP SOCKS5's FRAMING.
@@ -93,6 +94,15 @@ func socksUDPRequest(dstIP [4]byte, dstPort uint16, payload []byte) []byte {
 func socksUDPTarget(dstIP [4]byte, dstPort uint16, host string, payload []byte) []byte {
 	if host == "" {
 		return socksUDPRequest(dstIP, dstPort, payload)
+	}
+	// A HOST THAT CARRIES ITS OWN PORT IS SPLIT, so the SOCKS5 request names the right one. The name
+	// form of this frame has a length byte and then the bytes, so appending ":port" to a name would be
+	// a malformed address the proxy cannot resolve.
+	if h, p, err := net.SplitHostPort(host); err == nil {
+		host = h
+		if n, err := strconv.Atoi(p); err == nil {
+			dstPort = uint16(n)
+		}
 	}
 	if len(host) > 255 {
 		// A DNS NAME CANNOT EXCEED 255 BYTES, and a length byte that wrapped would send a truncated
