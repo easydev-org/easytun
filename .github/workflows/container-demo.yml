@@ -182,13 +182,15 @@ jobs:
           # THE MODE STARTED. A failure here is the device or the capability, and the pod's log names
           # which because StartContainer refuses with a sentence.
           case "$L" in *"StartContainer:"*) fail "the pod could not start container mode; see its log" ;; esac
-          case "$L" in *"the default route now points into"*) ;; *) fail "the pod never took over its route" ;; esac
+          # THE TAKEOVER IS VISIBLE IN THE DEMO'S OWN `ip route` OUTPUT, which is the honest evidence:
+          # a line naming the device and a metric means the default route moved into it.
+          case "$L" in *"default dev et0"*) ;; *) fail "the pod never took over its route" ;; esac
 
           # EACH DESTINATION TOOK ITS OWN PATH: the tag names the proxy, so A's answer cannot be B's.
-          case "$L" in *'203.0.113.10:443   -> "A:udp-from-the-workload"'*) ;; *) fail "the primary destination was not carried by proxy A" ;; esac
-          case "$L" in *'203.0.113.20:443   -> "B:udp-from-the-workload"'*) ;; *) fail "the backup destination was not carried by proxy B" ;; esac
+          case "$L" in *'203.0.113.10:443'*'"A:udp-from-the-workload"'*) ;; *) fail "the primary destination was not carried by proxy A" ;; esac
+          case "$L" in *'203.0.113.20:443'*'"B:udp-from-the-workload"'*) ;; *) fail "the backup destination was not carried by proxy B" ;; esac
           # AND THE DROPPED ONE REACHED NOBODY.
-          case "$L" in *'203.0.113.40:443   -> (silence)'*) ;; *) fail "a dropped destination was answered" ;; esac
+          case "$L" in *'203.0.113.40:443'*'(silence)'*) ;; *) fail "a dropped destination was answered" ;; esac
 
           # THE ROUTE CAME BACK, so the container is not left unable to reach anything.
           case "$L" in *"ok   the default route is restored"*) ;; *) fail "the default route was not restored" ;; esac

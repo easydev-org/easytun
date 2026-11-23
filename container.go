@@ -138,11 +138,16 @@ func StartContainer(cfg ContainerConfig) (*Container, error) {
 			exempt = append(exempt, host)
 		}
 	}
+	// THE RESOLVED ADDRESSES, not the names: what is installed is what must be removed.
+	var exempted []string
 	for _, host := range exempt {
-		if err := exemptRouteFn(host, before); err != nil {
+		addr, err := exemptRouteFn(host, before)
+		if err != nil {
 			return nil, fmt.Errorf("exempting %s: %w", host, err)
 		}
+		exempted = append(exempted, addr)
 	}
+	exempt = exempted
 
 	// THE DEVICE. A fresh one: a leftover from a killed process would carry somebody else's default
 	// route, and the takeover below would look like it worked while sending traffic to nothing.
@@ -365,12 +370,12 @@ var exemptRouteFn = exemptRoute
 //
 // A /32 IS SPECIFIC ENOUGH TO WIN OVER THE DEFAULT, which is the point: the route lookup prefers the
 // longest prefix, so the proxy keeps its old way out while everything else moves.
-func exemptRoute(host string, before defaultRoute) error {
+func exemptRoute(host string, before defaultRoute) (string, error) {
 	ip := net.ParseIP(host)
 	if ip == nil {
 		addrs, err := net.LookupIP(host)
 		if err != nil || len(addrs) == 0 {
-			return fmt.Errorf("%q is not an address and does not resolve", host)
+			return "", fmt.Errorf("%q is not an address and does not resolve", host)
 		}
 		ip = addrs[0]
 	}
@@ -380,7 +385,11 @@ func exemptRoute(host string, before defaultRoute) error {
 	}
 	args = append(args, "dev", before.dev)
 	if out, err := run("ip", args...); err != nil {
-		return fmt.Errorf("ip %v: %v (%s)", args, err, firstLine(out))
+		return "", fmt.Errorf("ip %v: %v (%s)", args, err, firstLine(out))
 	}
-	return nil
+	// THE ADDRESS IS RETURNED, NOT THE NAME, because Close deletes what was installed - and
+	// `ip route del proxy-a/32` is refused as `any valid prefix is expected`. MEASURED in a pod: the
+	// exemptions were installed by address and removed by name, so Close reported three failures and
+	// the namespace kept routes it no longer needed.
+	return ip.String(), nil
 }

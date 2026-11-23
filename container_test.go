@@ -203,7 +203,7 @@ func TestAHostnameUpstreamIsResolvedForItsException(t *testing.T) {
 	old := exemptRouteFn
 	defer func() { exemptRouteFn = old }()
 	var got string
-	exemptRouteFn = func(host string, _ defaultRoute) error { got = host; return nil }
+	exemptRouteFn = func(host string, _ defaultRoute) (string, error) { got = host; return "203.0.113.9", nil }
 
 	var log routeLog
 	log.install(t, "default via 172.17.0.1 dev eth0\n")
@@ -320,5 +320,56 @@ func TestOnlyTheRelayThatCreatedTheDeviceRemovesIt(t *testing.T) {
 	if removed != 1 {
 		t.Fatalf("container mode removed the device %d times, want 1 (by the Container, not the "+
 			"relay)", removed)
+	}
+}
+
+// AN EXEMPTION IS INSTALLED BY ADDRESS AND REMOVED BY THE SAME ADDRESS.
+//
+// MEASURED IN A POD: `Exempt: []string{"proxy-a"}` resolved the name, installed `ip route replace
+// <ip>/32`, and Close then tried `ip route del proxy-a/32` - which is refused as `any valid prefix is
+// expected rather than "proxy-a/32"`. So Close reported three failures and the namespace kept routes
+// it had no use for. The name is resolved ONCE, and what was installed is what is removed.
+func TestAnExemptionIsRemovedByTheAddressItWasInstalledWith(t *testing.T) {
+	var log routeLog
+	log.install(t, "default via 172.17.0.1 dev eth0\n")
+	oldOpen, oldUp, oldRemove, oldExempt := openDevice, bringUp, removeDevice, exemptRouteFn
+	defer func() {
+		openDevice, bringUp, removeDevice, exemptRouteFn = oldOpen, oldUp, oldRemove, oldExempt
+	}()
+	openDevice = func(string) (tunDevice, error) { return newPipeline(), nil }
+	bringUp = func(string, string) error { return nil }
+	removeDevice = func(string) error { return nil }
+	// A NAME IN, AN ADDRESS OUT - which is what a real resolver does.
+	exemptRouteFn = func(host string, _ defaultRoute) (string, error) {
+		if host == "proxy.example" {
+			return "203.0.113.9", nil
+		}
+		return host, nil
+	}
+
+	c, err := StartContainer(ContainerConfig{Name: "ex0", Exempt: []string{"proxy.example"}})
+	if err != nil {
+		t.Fatalf("StartContainer: %v", err)
+	}
+	log.cmds = nil
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	for _, cmd := range log.cmds {
+		if strings.Contains(cmd, "route del proxy.example") {
+			t.Fatalf("Close removed the exemption by NAME, which `ip` refuses:\n%s",
+				strings.Join(log.cmds, "\n"))
+		}
+	}
+	found := false
+	for _, cmd := range log.cmds {
+		if strings.Contains(cmd, "route del 203.0.113.9/32") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Close did not remove the exemption by the address it was installed with:\n%s",
+			strings.Join(log.cmds, "\n"))
 	}
 }
