@@ -637,8 +637,17 @@ func (r *Relay) Close() error {
 		r.mu.Unlock()
 
 		var problems []string
-		if err := removePolicy(r.guest, r.table); err != nil {
-			problems = append(problems, err.Error())
+		// A RELAY WITH NO TABLE OWNS NO POLICY, AND MUST NOT FLUSH ONE.
+		//
+		// MEASURED, AND IT IS THE WORST BUG THIS FILE HAS HAD: `ip route flush table 0` flushes the
+		// MAIN table, because table 0 IS main. The container mode builds a relay with no policy of its
+		// own - the takeover is the default route - so `table` is zero, and Close wiped the namespace's
+		// entire routing: every route gone, `ip route show table main` empty, and the container unable
+		// to reach anything while Close reported success.
+		if r.table != 0 {
+			if err := removePolicy(r.guest, r.table); err != nil {
+				problems = append(problems, err.Error())
+			}
 		}
 		if r.ownsDevice {
 			if err := removeDevice(r.name); err != nil {

@@ -233,65 +233,20 @@ func (c *Container) Close() error {
 	c.once = true
 	var problems []string
 
-	// THE ROUTE GOES BACK BEFORE THE DEVICE IS TORN DOWN, AND THE ORDER IS THE POINT.
+	// EVERYTHING THAT DESTROYS A ROUTE RUNS FIRST, AND THE DEFAULT ROUTE IS PUT BACK LAST.
 	//
-	// `relay.Close()` closes the tun's file descriptor, which DELETES the device - and a default route
-	// pointing at a device that is gone is a route to nowhere. MEASURED in a real pod: with the relay
-	// closed first, the restore step failed with `Nexthop has invalid gateway`, because the namespace's
-	// only way out had been removed a moment earlier. Restore the route first and the gateway is still
-	// reachable when the kernel validates it.
+	// THE ORDER IS THE WHOLE BUG. MEASURED IN A POD, step by step: restoring the default route and THEN
+	// closing the tun and deleting the device left the namespace with NO default route, and
+	// `ip route show default` was empty while Close reported success. The device deletion takes the
+	// route with it - a tun whose fd closes removes what depends on it, and the restored route's
+	// gateway resolution depended on the very state the takeover had changed.
+	//
+	// So the route is restored when nothing is left to remove it: after the relay is closed, after the
+	// device is gone, after the mark rules and the saved table are flushed. A route written last stays
+	// written.
 
-	// THE DEFAULT ROUTE GOES BACK TO WHAT IT WAS, not to nothing: a container whose default route is
-	// deleted has no way out at all.
-	//
-	// THE RELAY'S OWN DEFAULT ROUTE IS REMOVED FIRST, BY NAME.
-	//
-	// MEASURED: the takeover installs `default dev et0 metric 100`, and restoring `default via <gw> dev
-	// eth0` leaves BOTH - two default routes, one per device. `ip route show default` printed the
-	// restored one, so it looked fine, but the tun's copy outlives the device by a moment and the
-	// namespace's routing is two routes deep. Deleting it by its exact form first is what makes the
-	// restore a replacement rather than an addition.
-	_, _ = run("ip", "route", "del", "default", "dev", c.Name)
-
-	// THE DEFAULT ROUTE GOES BACK EXACTLY AS IT WAS, AND THE GATEWAY IS NOT OPTIONAL.
-	//
-	// MEASURED WHILE WRITING THIS: a `default dev <iface>` WITH NO GATEWAY HIJACKS LOCAL ADDRESSES.
-	// After such a restore, `ip route get 127.0.0.1` answered `dev veth0` instead of `dev lo` - so
-	// every 127.0.0.1 connection in the namespace went to the wire. A gateway-less default is only
-	// correct on a point-to-point link; for a namespace that had one, restoring without it breaks
-	// loopback, which is worse than the route being absent.
-	//
-	// So an exact restore that fails is REPORTED rather than approximated. The caller sees which
-	// route could not be rebuilt and can re-create it; a wrong route silently breaks everything.
-	args := []string{"route", "replace", "default"}
-	if c.before.via != "" {
-		args = append(args, "via", c.before.via)
-	}
-	if c.before.dev != "" {
-		args = append(args, "dev", c.before.dev)
-	}
-	if out, err := run("ip", args...); err != nil {
-		// THE GATEWAY CAN BE UNREACHABLE FOR A REASON THAT IS NOT A BUG IN THIS CODE - the route was
-		// recorded on a link that has since gone, which is what a test fixture with a dead peer looks
-		// like. The DEVICE-ONLY form is tried as a last resort, because a namespace with NO default
-		// route can reach nothing at all, and that is worse than one that routes to a link with no peer.
-		//
-		// A GATEWAY-LESS DEFAULT CAN HIJACK LOOPBACK (measured), so this is a LAST resort and the
-		// original failure is still reported: the caller learns both that the exact route could not be
-		// rebuilt and what was put in its place.
-		fallback := []string{"route", "replace", "default", "dev", c.before.dev}
-		if out2, err2 := run("ip", fallback...); err2 != nil {
-			problems = append(problems, fmt.Sprintf("restoring the default route (%s): %v (%s); the "+
-				"fallback (%s) also failed: %v (%s)", strings.Join(args, " "), err, firstLine(out),
-				strings.Join(fallback, " "), err2, firstLine(out2)))
-		} else {
-			problems = append(problems, fmt.Sprintf("the default route could not be restored exactly "+
-				"(%v: %s), so it points at %s with no gateway; check whether that link reaches anything",
-				err, firstLine(out), c.before.dev))
-		}
-	}
-
-	// AND ONLY NOW IS THE DEVICE TORN DOWN, when nothing points at it.
+	// THE RELAY FIRST: closing it releases the fd, which deletes the device, which takes any route
+	// through it. Doing this before the restore is what stops the delete from undoing the restore.
 	if err := c.relay.Close(); err != nil {
 		problems = append(problems, err.Error())
 	}
@@ -306,6 +261,34 @@ func (c *Container) Close() error {
 				host, err, firstLine(out)))
 		}
 	}
+
+	// AND NOW THE DEFAULT ROUTE, WITH NOTHING LEFT TO REMOVE IT.
+	//
+	// THE GATEWAY IS NOT OPTIONAL. MEASURED: a `default dev <iface>` with no gateway HIJACKS LOOPBACK -
+	// `ip route get 127.0.0.1` answered `dev veth0` instead of `dev lo`, so every 127.0.0.1 connection
+	// in the namespace went to the wire. A gateway-less default is only correct on a point-to-point
+	// link; for a namespace that had one, restoring without it breaks loopback, which is worse than the
+	// route being absent. So an exact restore that fails is REPORTED rather than approximated.
+	args := []string{"route", "replace", "default"}
+	if c.before.via != "" {
+		args = append(args, "via", c.before.via)
+	}
+	if c.before.dev != "" {
+		args = append(args, "dev", c.before.dev)
+	}
+	if out, err := run("ip", args...); err != nil {
+		problems = append(problems, fmt.Sprintf("restoring the default route (%s): %v (%s)",
+			strings.Join(args, " "), err, firstLine(out)))
+	}
+
+	// AND IT IS VERIFIED, because "the command exited zero" is not "there is a route": a namespace with
+	// no default route can reach nothing, and a silent success there is the failure this whole block
+	// exists to prevent.
+	if got, _ := run("ip", "route", "show", "default"); strings.TrimSpace(got) == "" {
+		problems = append(problems, "the default route is absent after the restore, so this namespace "+
+			"can reach nothing; rebuild it with `ip route replace default ...`")
+	}
+
 	if len(problems) > 0 {
 		return fmt.Errorf("easytun: the container's network was not fully restored: %v", problems)
 	}

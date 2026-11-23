@@ -77,10 +77,13 @@ func TestContainerExemptsTheProxyBeforeTheTakeover(t *testing.T) {
 	}
 }
 
-// CLOSE PUTS THE ROUTE BACK, AND BEFORE IT DELETES THE DEVICE.
+// CLOSE RESTORES THE ROUTE LAST, AFTER EVERYTHING THAT COULD TAKE IT AWAY.
 //
-// A default route left pointing at a deleted device sends every packet to nowhere, and the container
-// looks healthy while reaching nothing.
+// THIS TEST ASSERTED THE OPPOSITE FIRST, AND A REAL POD PROVED IT WRONG. The intuition was "restore the
+// route before deleting the device, or the route points at nothing". MEASURED: the deletion is what
+// takes the route - closing the tun removes what depends on it, and the restored route went with it, so
+// `ip route show default` was empty while Close reported success. The route is written when nothing is
+// left to remove it.
 func TestCloseRestoresTheRouteBeforeRemovingTheDevice(t *testing.T) {
 	var log routeLog
 	log.install(t, "default via 172.17.0.1 dev eth0\n")
@@ -118,8 +121,10 @@ func TestCloseRestoresTheRouteBeforeRemovingTheDevice(t *testing.T) {
 	if deleteAt < 0 {
 		t.Fatal("Close did not remove the device")
 	}
-	if restoreAt > deleteAt {
-		t.Fatalf("the device was deleted before the route was restored:\n%s", strings.Join(log.cmds, "\n"))
+	if restoreAt < deleteAt {
+		t.Fatalf("the route was restored BEFORE the device was deleted, and the deletion takes it with "+
+			"it - a pod measured an empty default route reported as success:\n%s",
+			strings.Join(log.cmds, "\n"))
 	}
 }
 

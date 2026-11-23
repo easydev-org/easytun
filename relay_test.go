@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -438,4 +439,49 @@ func atoi16(s string) uint16 {
 		n = n*10 + uint16(c-'0')
 	}
 	return n
+}
+
+// A RELAY WITH NO TABLE MUST NOT FLUSH MAIN.
+//
+// `ip route flush table 0` FLUSHES MAIN, because table 0 IS main. The container mode builds a relay with
+// no policy of its own, so its table is zero - and Close wiped the namespace's entire routing while
+// reporting success. MEASURED in a pod: `ip route show table main` was empty afterwards and the container
+// could reach nothing.
+//
+// THIS ASSERTS THE COMMAND IS NOT RUN, which is the only part a test can see without a namespace.
+func TestARelayWithNoTableDoesNotFlushMain(t *testing.T) {
+	var cmds []string
+	oldRun := runFn
+	runFn = func(name string, args ...string) (string, error) {
+		cmds = append(cmds, name+" "+strings.Join(args, " "))
+		return "", nil
+	}
+	t.Cleanup(func() { runFn = oldRun })
+
+	for _, table := range []int{0, 100} {
+		r := &Relay{table: table, guest: "172.30.0.2", ownsDevice: false, tun: newPipeline(),
+			done: make(chan struct{}), sessions: map[key]*session{}}
+		if err := r.Close(); err != nil {
+			t.Fatalf("table %d: Close: %v", table, err)
+		}
+	}
+
+	flushesMain := false
+	flushesTable := false
+	for _, cmd := range cmds {
+		if strings.Contains(cmd, "route flush table 0") {
+			flushesMain = true
+		}
+		if strings.Contains(cmd, "route flush table 100") {
+			flushesTable = true
+		}
+	}
+	if flushesMain {
+		t.Fatalf("a relay with table 0 flushed MAIN, which is the entire namespace's routing:\n%s",
+			strings.Join(cmds, "\n"))
+	}
+	if !flushesTable {
+		t.Fatalf("a relay with a real table did not flush it, so it would leave routes behind:\n%s",
+			strings.Join(cmds, "\n"))
+	}
 }
