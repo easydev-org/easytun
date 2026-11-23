@@ -321,3 +321,61 @@ func TestADirectFlowWithANameDialsTheName(t *testing.T) {
 		t.Fatalf("payload %q, want %q", payload, "named:hi")
 	}
 }
+
+// THE DEVICE ADDRESS IS THE CALLER'S WHEN GIVEN, AND DERIVED WHEN NOT.
+//
+// THE DERIVATION IS A HASH OF THE DEVICE NAME, so `e2etun0` gets 10.99.60.1 and a rename moves the
+// address to a different /24 - fine for uniqueness in one namespace, confusing when a log names an
+// address and a reader wants to find the device. A caller that needs a predictable address sets it.
+func TestTheDeviceAddressIsTheCallersWhenGiven(t *testing.T) {
+	var cidr string
+	oldOpen, oldUp, oldPolicy, oldRemove := openDevice, bringUp, installPolicy, removePolicy
+	defer func() {
+		openDevice, bringUp, installPolicy, removePolicy = oldOpen, oldUp, oldPolicy, oldRemove
+	}()
+	openDevice = func(string) (tunDevice, error) { return newPipeline(), nil }
+	bringUp = func(_, c string) error { cidr = c; return nil }
+	installPolicy = func(string, string, int) error { return nil }
+	removePolicy = func(string, int) error { return nil }
+
+	cases := []struct{ given, want string }{
+		{"10.99.7.1/24", "10.99.7.1/24"}, // a prefix is honoured
+		{"10.99.7.1", "10.99.7.1/24"},    // a bare address gets the usual /24
+		{"10.42.0.1/16", "10.42.0.1/16"}, // and a different prefix means what it says
+	}
+	for _, c := range cases {
+		cidr = ""
+		r, err := Start(Config{GuestIP: "172.30.0.2", Name: "addr0", Address: c.given})
+		if err != nil {
+			t.Fatalf("Start with Address=%q: %v", c.given, err)
+		}
+		if err := r.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if cidr != c.want {
+			t.Errorf("Address=%q gave the device %q, want %q", c.given, cidr, c.want)
+		}
+	}
+
+	// AND EMPTY DERIVES FROM THE TABLE, which is the behaviour that keeps two relays apart.
+	cidr = ""
+	r, err := Start(Config{GuestIP: "172.30.0.2", Name: "e2etun0"})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = r.Close() }()
+	if want := addrFor(r.table) + "/24"; cidr != want {
+		t.Errorf("with no Address the device got %q, want the derived %q", cidr, want)
+	}
+}
+
+// TWO RELAYS IN ONE NAMESPACE WITH EXPLICIT ADDRESSES MUST NOT COLLIDE, so a caller that sets them is
+// responsible for setting both.
+func TestAnExplicitAddressCanCollideAndThatIsTheCallersJob(t *testing.T) {
+	// This is a DOCUMENTATION test: it pins that the package does not silently rewrite an explicit
+	// address, because a caller that asked for 10.99.7.1 and got 10.99.8.1 would be worse served than
+	// one that got an EEXIST from `ip addr add`.
+	if got := deviceCIDR("10.99.7.1/24", 137); got != "10.99.7.1/24" {
+		t.Fatalf("an explicit address was rewritten to %q", got)
+	}
+}

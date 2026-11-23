@@ -39,6 +39,15 @@ type Config struct {
 	// Table is the policy-routing table number. Zero means "pick one from the name", so two relays
 	// in different namespaces do not collide and two in the same one do not either.
 	Table int
+	// Address is the device's own address, with or without a prefix length: "10.99.7.1" and
+	// "10.99.7.1/24" both mean the same thing, and a bare address gets /24.
+	//
+	// EMPTY MEANS "DERIVE IT FROM THE TABLE", which keeps two relays in one namespace apart. But the
+	// derivation makes the address follow the DEVICE NAME through a hash, so `e2etun0` gets 10.99.60.1
+	// and `e2etun1` gets a different /24 entirely - fine for uniqueness, confusing when a log names an
+	// address and a reader wants to find the device. A caller that needs a predictable address sets
+	// this.
+	Address string
 	// Route decides where one flow goes. Nil means "everything through Upstream".
 	Route func(dst net.IP, port uint16) Route
 	// Logf receives one line per failure. Nil means no logging.
@@ -186,7 +195,7 @@ func Start(cfg Config) (*Relay, error) {
 	// the second `ip addr add` would fail with EEXIST and read as an unrelated network error. Deriving
 	// it from the chosen table rather than the hash means a relay that was pushed off its bucket still
 	// gets an address no other relay holds.
-	cidr := fmt.Sprintf("%s/24", addrFor(table))
+	cidr := deviceCIDR(cfg.Address, table)
 	if err := bringUp(name, cidr); err != nil {
 		_ = tun.Close()
 		_ = deleteTun(name)
@@ -374,6 +383,21 @@ var tableInUse = func(n int) bool {
 		return false
 	}
 	return strings.TrimSpace(out) != ""
+}
+
+// deviceCIDR answers the address the device gets: the caller's if given, else derived from the table.
+//
+// THE CALLER'S PREFIX IS HONOURED, AND A BARE ADDRESS GETS /24. `10.99.7.1` and `10.99.7.1/24` mean the
+// same thing, because a caller who wrote an address without a prefix meant "the usual /24" and one who
+// wrote /16 meant it - guessing the other way for either would be a surprise.
+func deviceCIDR(explicit string, table int) string {
+	if explicit == "" {
+		return fmt.Sprintf("%s/24", addrFor(table))
+	}
+	if strings.Contains(explicit, "/") {
+		return explicit
+	}
+	return explicit + "/24"
 }
 
 // addrFor derives the device's own address from its chosen routing table, so two relays in one

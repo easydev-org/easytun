@@ -115,9 +115,14 @@ func StartContainer(cfg ContainerConfig) (*Container, error) {
 	if name == "" {
 		name = "easytun0"
 	}
+	// THE SAME RULE AS `Start`: a prefix is honoured, a bare address gets /24, and empty means the
+	// container mode's own default - which is fixed rather than derived, because a container has one
+	// relay and no second address to avoid.
 	addr := cfg.Address
 	if addr == "" {
 		addr = "10.99.0.1/24"
+	} else if !strings.Contains(addr, "/") {
+		addr = addr + "/24"
 	}
 	logf := cfg.Logf
 	if logf == nil {

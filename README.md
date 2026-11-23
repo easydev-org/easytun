@@ -83,7 +83,10 @@ longer local.
 ## What it does, precisely
 
 1. Opens `/dev/net/tun` and asks for `IFF_TUN | IFF_NO_PI`.
-2. Addresses the device `10.99.<n>.1/24` and raises it.
+2. Addresses the device and raises it. By default the address is `10.99.<n>.1/24`, where `<n>` comes
+   from the routing table, which comes from a hash of the device name — so `e2etun0` gets
+   `10.99.60.1/24` and a rename moves it to a different /24. **Set `Config.Address` when you need a
+   predictable one**: a bare address gets `/24`, and an explicit prefix is honoured.
 3. Installs, **for this guest's UDP only**:
 
    ```
@@ -128,7 +131,8 @@ neither may collide:
   hash of the device name** in `100..199`. The hash alone is not enough — a hundred buckets cannot
   hold an unbounded set of names without a collision — so `chooseTable` probes until it finds one that
   is free.
-* The address follows the chosen table (`10.99.<table%100>.1`), so two relays never claim one /24.
+* The address follows the chosen table (`10.99.<table%100>.1`), so two relays never claim one /24 —
+  unless the caller sets `Config.Address` on both, in which case keeping them apart is their job.
 
 ## What it does **not** do
 
