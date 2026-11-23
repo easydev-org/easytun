@@ -1,21 +1,24 @@
 # THE CONTAINER-MODE DEMO IMAGE.
 #
-# It carries ONE program and the two tools that program calls: `ip` (real iproute2, because busybox's
-# has no `ipproto`) and nothing else. That is the whole dependency list for taking over a container's
-# network with easytun - no proxy, no DNS server, no sidecar.
+# It carries ONE program and the tools that program calls: `ip` (real iproute2, because busybox's has no
+# `ipproto`). That is the whole dependency list for taking over a container's network with easytun - no
+# proxy, no DNS server, no sidecar.
 FROM golang:1.26-alpine AS build
 WORKDIR /src
-COPY go.mod go.sum ./
+# THE DEMO IS ITS OWN MODULE (testdata/container-demo), so it resolves easytun by its published tag -
+# which is what makes this image prove the version a caller actually gets. The library's root has no
+# go.sum because it has no dependencies, so only the demo's module files are copied here.
+COPY testdata/container-demo/go.mod testdata/container-demo/go.sum ./
 RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -o /out/demo ./testdata/container-demo
+COPY testdata/container-demo/ ./
+RUN CGO_ENABLED=0 go build -o /out/demo .
 
 FROM alpine:3.21
 # REAL iproute2, NOT BUSYBOX. MEASURED: alpine's /sbin/ip is busybox, which cannot do `rule ... ipproto`
 # and answers `invalid argument 'ipproto' to 'ip'` - a sentence that names neither the binary nor the
-# package. `ip route` works in busybox, but a container mode that also installs policy rules does not.
+# package. This mode also installs fwmark rules, which busybox likewise lacks.
 RUN apk add --no-cache iproute2
 COPY --from=build /out/demo /usr/local/bin/demo
-# THE DEVICE IS NOT IN THE IMAGE: the runtime gives it with `--device /dev/net/tun`, and Preflight
-# refuses with a sentence when it is missing.
+# THE DEVICE IS NOT IN THE IMAGE: the runtime gives it with `--device /dev/net/tun` (or a hostPath in a
+# pod), and StartContainer refuses with a sentence when it is missing.
 ENTRYPOINT ["/usr/local/bin/demo"]
