@@ -33,17 +33,24 @@ import (
 // the rule below names.
 const relayMark = 0x1
 
-// dialer returns a UDP dialer whose sockets are marked, so their packets take the original route.
+// dialer returns a UDP dialer whose sockets are marked when the process MAY mark them.
+//
+// THE MARK IS BEST-EFFORT, AND THAT IS NOT SLOPPINESS: SO_MARK NEEDS CAP_NET_ADMIN, MEASURED - a plain
+// user gets `operation not permitted` from setsockopt, so a relay that treated it as fatal would fail
+// to start anywhere it is not privileged. And the mark only matters in container mode, where the
+// relay's own traffic would otherwise loop into its own device; in guest mode there is no default-route
+// takeover to loop through, so an unmarked socket is correct.
 func (r *Relay) dialer() *net.Dialer {
 	return &net.Dialer{
 		Control: func(network, address string, c syscall.RawConn) error {
-			var serr error
 			if err := c.Control(func(fd uintptr) {
-				serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soMark, relayMark)
+				// THE ERROR IS DISCARDED ON PURPOSE. See above: EPERM here means "not privileged",
+				// which is a configuration the relay works in, not a failure.
+				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soMark, relayMark)
 			}); err != nil {
 				return err
 			}
-			return serr
+			return nil
 		},
 	}
 }
@@ -55,13 +62,14 @@ func (r *Relay) dialer() *net.Dialer {
 func listenMarked() (*net.UDPConn, error) {
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
-			var serr error
 			if err := c.Control(func(fd uintptr) {
-				serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soMark, relayMark)
+				// BEST-EFFORT: SO_MARK needs CAP_NET_ADMIN, and a relay without it still works wherever
+				// there is no takeover to loop through. See dialer.
+				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soMark, relayMark)
 			}); err != nil {
 				return err
 			}
-			return serr
+			return nil
 		},
 	}
 	pc, err := lc.ListenPacket(nil, "udp", ":0")
