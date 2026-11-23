@@ -233,9 +233,13 @@ func (c *Container) Close() error {
 	c.once = true
 	var problems []string
 
-	if err := c.relay.Close(); err != nil {
-		problems = append(problems, err.Error())
-	}
+	// THE ROUTE GOES BACK BEFORE THE DEVICE IS TORN DOWN, AND THE ORDER IS THE POINT.
+	//
+	// `relay.Close()` closes the tun's file descriptor, which DELETES the device - and a default route
+	// pointing at a device that is gone is a route to nowhere. MEASURED in a real pod: with the relay
+	// closed first, the restore step failed with `Nexthop has invalid gateway`, because the namespace's
+	// only way out had been removed a moment earlier. Restore the route first and the gateway is still
+	// reachable when the kernel validates it.
 
 	// THE DEFAULT ROUTE GOES BACK TO WHAT IT WAS, not to nothing: a container whose default route is
 	// deleted has no way out at all.
@@ -278,6 +282,13 @@ func (c *Container) Close() error {
 		}
 	}
 
+	// AND ONLY NOW IS THE DEVICE TORN DOWN, when nothing points at it.
+	if err := c.relay.Close(); err != nil {
+		problems = append(problems, err.Error())
+	}
+	if err := removeDevice(c.Name); err != nil {
+		problems = append(problems, err.Error())
+	}
 	removeMarkRules(relayMark, originalTable)
 	_, _ = run("ip", "route", "flush", "table", strconv.Itoa(originalTable))
 	for _, host := range c.exempt {
@@ -285,9 +296,6 @@ func (c *Container) Close() error {
 			problems = append(problems, fmt.Sprintf("removing the exception for %s: %v (%s)",
 				host, err, firstLine(out)))
 		}
-	}
-	if err := removeDevice(c.Name); err != nil {
-		problems = append(problems, err.Error())
 	}
 	if len(problems) > 0 {
 		return fmt.Errorf("easytun: the container's network was not fully restored: %v", problems)
