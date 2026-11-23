@@ -106,6 +106,15 @@ jobs:
           docker run --rm -v "$PWD/.github/assert-default-route.sh:/check.sh:ro" \
             golang:1.26 sh /check.sh
 
+      # THE IMAGE NEEDS `ip`, AND THIS IS THE FIRST THING THE CONTAINER APPROACH FOUND.
+      #
+      # `golang:1.26` HAS NO iproute2, so every kernel test failed with
+      #
+      #	`ip [addr add 10.99.60.1/24 dev e2etun0]`: exec: "ip": executable file not found in $PATH
+      #
+      # That is not a bug in the library - it shells out to `ip` on purpose, so the caller's container
+      # must have it, and the README says so. Installing it here is what makes this job run the
+      # documented invocation rather than a privileged one that has everything by accident.
       - name: the kernel half, in a container with the device
         run: |
           set -eux
@@ -122,6 +131,7 @@ jobs:
             golang:1.26 \
             sh -c '
               set -eu
+              apt-get update -qq && apt-get install -y -qq iproute2 >/dev/null
               go test ./... -count=1 -v -run "E2E|TestOpenTun|TestIfreq" > /tmp/kernel.log 2>&1 || {
                 cat /tmp/kernel.log; exit 1;
               }
@@ -149,4 +159,8 @@ jobs:
             -e GOCACHE=/tmp/go-cache \
             -e GOFLAGS=-buildvcs=false \
             golang:1.26 \
-            sh -c 'go test ./... -count=1 -race'
+            sh -c '
+              set -eu
+              apt-get update -qq && apt-get install -y -qq iproute2 >/dev/null
+              go test ./... -count=1 -race
+            '
