@@ -100,10 +100,20 @@ func main() {
 	}
 	fmt.Println("=== after Close ===")
 	show("ip route show default")
-	if out, _ := exec.Command("ip", "route", "show", "default").Output(); strings.Contains(string(out), "et0") {
+	// "RESTORED" MEANS THERE IS ONE, NOT MERELY THAT IT IS NOT THE DEVICE.
+	//
+	// MEASURED: the first version of this check only tested `not et0`, so an EMPTY default route - the
+	// namespace with no way out at all - printed `ok`. That is the failure the restore exists to
+	// prevent, reported as a success.
+	out, _ := exec.Command("ip", "route", "show", "default").Output()
+	switch {
+	case strings.Contains(string(out), "et0"):
 		fmt.Println("FAIL: the default route still points at the device after Close")
 		fail = true
-	} else {
+	case len(strings.TrimSpace(string(out))) == 0:
+		fmt.Println("FAIL: Close left the namespace with NO default route, so it can reach nothing")
+		fail = true
+	default:
 		fmt.Println("ok   the default route is restored")
 	}
 
