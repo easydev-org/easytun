@@ -193,3 +193,49 @@ as "the relay is broken".
 Without a usable device the e2e tests **skip with the reason**, which is why the CI job in
 `.github/workflows/test.yml` asserts that none of them skipped — a green run that skipped everything
 proves nothing.
+
+## Container mode: take over the whole namespace
+
+`Start` relays one address out of a network it shares with others. A CONTAINER is the easy case: its
+network namespace is its own, so "everything" is a small, well-defined set, and there is no bridge, no
+DHCP, no NAT and no guest address to match on.
+
+```go
+c, err := easytun.StartContainer(easytun.ContainerConfig{
+    Name:     "et0",
+    Upstream: "110.0.0.5:7891",   // SOCKS5 for UDP; the proxy is exempted automatically
+    Route:    func(dst net.IP, port uint16) easytun.Route { ... },
+})
+if err != nil {
+    log.Fatal(err)   // names what was missing: the device, the capability, or a way out
+}
+defer c.Close()      // restores the default route and removes the device
+```
+
+```sh
+docker run --device /dev/net/tun --cap-add NET_ADMIN ...
+```
+
+**What it does, in the order that matters:**
+
+1. reads the default route, so it knows the way out before changing it
+2. installs an exception route for the proxy — **before** the takeover, or the relay's own connection
+   to it loops back into its own device (measured)
+3. moves the default route into the device
+4. relays every datagram the namespace sends
+
+**TCP and DNS are not the tun's.** A tun hands out IP packets; a TCP connection is a byte stream the
+kernel owns, so implementing one in userspace means writing a TCP stack. Instead:
+
+```go
+tcp, _ := c.StartTCP("mihomo:7890", route)
+// iptables -t nat -A OUTPUT -p tcp -j REDIRECT --to-ports <tcp.Port>
+// iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports <dns.Port>
+```
+
+`OUTPUT` and not `PREROUTING`: the traffic is made *here*, so it is locally generated. `StartTCP` needs
+no device and no capability — it is the same listener described above.
+
+**`Close` restores the exact route, and a failure is reported rather than approximated.** Measured:
+restoring `default dev <iface>` without a gateway hijacks loopback — `ip route get 127.0.0.1` answered
+`dev veth0` — so a namespace with a gateway gets it back or gets told it could not be.

@@ -1,0 +1,198 @@
+name: container-demo
+
+# BUILD THE CONTAINER-MODE DEMO, THEN RUN IT IN A REAL POD AND READ THE EVIDENCE FROM ITS LOG.
+#
+# THIS IS THE TEST THAT ANSWERS "does it work in a container", and nothing about it is simulated:
+#
+#	build the image in Actions, push it to ghcr
+#	start a pod from that image with /dev/net/tun and NET_ADMIN
+#	the pod takes over its own default route, makes UDP requests, and prints what happened
+#	the job asserts on THAT LOG, not on an exit code alone
+#
+# WHY A POD AND NOT A LOCAL `docker run`: the point is the container's OWN network namespace, and a pod
+# is the smallest thing with one that a cluster gives. It also proves the capability and device
+# requirements are right, because a pod without them fails at `Preflight` with a sentence.
+#
+# THE CLUSTER IS OPTIONAL. `push` always runs and proves the image builds; `pod` runs only where
+# KUBECONFIG is provided, because a GitHub runner has no cluster and a workflow that assumed one would
+# be red for everybody.
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "Containerfile.demo"
+      - "testdata/container-demo/**"
+      - ".github/workflows/container-demo.yml"
+      - "*.go"
+      - "go.mod"
+  pull_request:
+    paths:
+      - "Containerfile.demo"
+      - "testdata/container-demo/**"
+      - ".github/workflows/container-demo.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: container-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/container-demo
+
+jobs:
+  image:
+    name: build and push the demo image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Containerfile.demo
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # THE IMAGE MUST CARRY REAL iproute2. MEASURED: alpine's busybox `ip` cannot do `rule ipproto`,
+      # and the container mode needs that for the guest-scoped policy. A build that silently shipped
+      # busybox would fail in the pod with a message about `ipproto`, three layers from the cause.
+      - name: the image has real iproute2, not busybox
+        run: |
+          set -eux
+          docker run --rm --entrypoint /bin/sh "${{ env.IMAGE }}:${{ github.sha }}" -c '
+            set -eux
+            ip -V
+            # busybox prints "BusyBox v..." and has no `-V`; iproute2 prints "ip utility".
+            ip -V | grep -q "ip utility"
+            command -v ip
+          '
+
+  pod:
+    name: run it in a pod and assert on the log
+    needs: image
+    # ONLY WHERE A CLUSTER IS PROVIDED. A runner has none, and a workflow that required one would be
+    # red for every fork and every local run of `act`.
+    if: ${{ vars.KUBE_CONTEXT != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: the cluster's credentials
+        run: |
+          set -eux
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG }}" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          kubectl config use-context "${{ vars.KUBE_CONTEXT }}"
+          kubectl version --output=yaml | head -5
+
+      - name: start the pod
+        run: |
+          set -eux
+          # THE IMAGE IS PULLED FROM GHCR, so the pod runs exactly the bytes this run built. A
+          # `:latest` would be whatever was pushed last, which is the drift this avoids.
+          cat > /tmp/pod.yaml <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: easytun-container-demo
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: demo
+                image: IMAGE_TAG
+                # THE TWO THINGS CONTAINER MODE NEEDS, and nothing else. A pod without them fails at
+                # Preflight with a sentence that names which one is missing.
+                securityContext:
+                  capabilities:
+                    add: ["NET_ADMIN"]
+                volumeDevices: []
+                # /dev/net/tun IS A HOST DEVICE, not a volume: a pod asks for it this way, and the
+                # device plugin is not needed because it exists on every Linux node.
+          YAML
+          # the device is requested through a hostPath, which is how a pod gets /dev/net/tun
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("/tmp/pod.yaml")
+          s = p.read_text()
+          s = s.replace("IMAGE_TAG", "${{ needs.image.outputs.image }}:${{ github.sha }}")
+          s = s.replace("                volumeDevices: []\n", """                volumeMounts:
+                  - name: dev
+                    mountPath: /dev/net
+                    readOnly: false
+            volumes:
+              - name: dev
+                hostPath:
+                  path: /dev/net
+                  type: Directory
+          """)
+          p.write_text(s)
+          PY
+          cat /tmp/pod.yaml
+          kubectl apply -f /tmp/pod.yaml
+
+      - name: wait for it to finish, and read the log
+        run: |
+          set -eux
+          # A BOUNDED WAIT, NOT A SLEEP: `wait` watches the phase and returns when it leaves Pending or
+          # Running. The timeout is generous because the first pull of a new image on a cold node is
+          # the slow part.
+          kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/easytun-container-demo \
+            --timeout=180s || true
+          echo "=== phase ==="
+          kubectl get pod easytun-container-demo -o jsonpath='{.status.phase}{"\n"}' || true
+          echo "=== log ==="
+          kubectl logs easytun-container-demo | tee /tmp/demo.log || true
+          echo "=== describe, if it did not run ==="
+          kubectl describe pod easytun-container-demo | tail -30 || true
+
+      - name: assert on what the pod printed
+        run: |
+          set -eux
+          L=$(cat /tmp/demo.log 2>/dev/null || true)
+          fail() { echo "::error::$*"; exit 1; }
+
+          # THE MODE STARTED. A failure here is the device or the capability, and the pod's own log
+          # says which because Preflight names it.
+          case "$L" in *"StartContainer:"*) fail "the pod could not start container mode; its log names why" ;; esac
+          case "$L" in *"the default route now points into"*) ;; *) fail "the pod never took over its default route" ;; esac
+
+          # THE WORKLOAD'S DATAGRAMS CAME BACK THROUGH THE DEVICE, which is the claim.
+          case "$L" in *"FAIL"*) fail "a request failed; the log above says which" ;; esac
+          [ "$(printf '%s' "$L" | grep -c '^ok   ')" -ge 2 ] || fail "fewer than two requests succeeded"
+
+          # AND THE ROUTE WAS RESTORED, so the container is not left unable to reach anything.
+          case "$L" in *"ok   the default route is restored"*) ;; *) fail "the default route was not restored after Close" ;; esac
+          case "$L" in *"RESULT: container mode works"*) ;; *) fail "the pod did not reach its success line" ;; esac
+
+          echo "container mode works in a pod"
+
+      - name: clean up
+        if: always()
+        run: kubectl delete pod easytun-container-demo --ignore-not-found || true

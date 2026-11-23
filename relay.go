@@ -111,6 +111,11 @@ type Relay struct {
 	mu       sync.Mutex
 	sessions map[key]*session
 
+	// ownsDevice says whether Close removes the device. `Start` creates one and must remove it; the
+	// container mode hands the device to a Container that owns the routing, and a relay that deleted it
+	// would leave a default route pointing at nothing.
+	ownsDevice bool
+
 	done chan struct{}
 	once sync.Once
 	// closed records the first Close's error, so a caller that runs it twice learns whether the
@@ -205,9 +210,34 @@ func Start(cfg Config) (*Relay, error) {
 		return nil, err
 	}
 
+	r.start()
+	return r, nil
+}
+
+// start begins the two loops. Split out so a second starter (the container mode) can reuse the device,
+// the session table and the forwarding without the guest-scoped policy.
+func (r *Relay) start() {
 	go r.readTun()
 	go r.sweep()
-	return r, nil
+}
+
+// newRelay builds a relay around an already-open device, WITHOUT installing any routes.
+//
+// THE CALLER OWNS THE ROUTING IN THIS CASE. The guest-scoped policy `Start` installs - "from this one
+// address, ipproto udp, into a table of its own" - is exactly wrong for a container whose own traffic
+// is the thing being relayed, and a second routing scheme bolted onto the first is how the two end up
+// fighting. So this is the seam: a relay that forwards, and a caller that decides how packets reach it.
+func newRelay(name string, tun tunDevice, cfg Config, logf func(string, ...any)) *Relay {
+	return &Relay{
+		tun:      tun,
+		upstream: cfg.Upstream,
+		route:    cfg.Route,
+		logf:     logf,
+		name:     name,
+		guest:    cfg.GuestIP,
+		sessions: map[key]*session{},
+		done:     make(chan struct{}),
+	}
 }
 
 // bringUp addresses the device and raises it.
@@ -595,8 +625,10 @@ func (r *Relay) Close() error {
 		if err := removePolicy(r.guest, r.table); err != nil {
 			problems = append(problems, err.Error())
 		}
-		if err := removeDevice(r.name); err != nil {
-			problems = append(problems, err.Error())
+		if r.ownsDevice {
+			if err := removeDevice(r.name); err != nil {
+				problems = append(problems, err.Error())
+			}
 		}
 		if len(problems) > 0 {
 			r.closedErr = fmt.Errorf("easytun: cleanup left state behind: %v", problems)

@@ -235,3 +235,88 @@ func TestE2ETwoRelaysGetDifferentTablesAndAddresses(t *testing.T) {
 		}
 	}
 }
+
+// CONTAINER MODE ON A REAL KERNEL: the namespace's own default route moves into the device, a local
+// process's datagram arrives in it, and Close puts the route back.
+//
+// THIS IS THE TEST THAT PROVES THE MODE IS REAL rather than a set of `ip` arguments in the right order.
+// It needs NET_ADMIN and a namespace with a default route, which `unshare -Urn` does not give by
+// default - so it skips there and runs in the CI job that has both.
+func TestE2EContainerTakesOverTheDefaultRoute(t *testing.T) {
+	skipWithoutATun(t)
+
+	// A DEFAULT ROUTE WITH A REACHABLE GATEWAY MUST EXIST, or there is nothing to take over and
+	// nothing to restore.
+	//
+	// THE GATEWAY MUST BE REMOTE. MEASURED: a veth pair entirely inside one namespace gives its far
+	// end a LOCAL address, and `ip route replace default via <local>` is refused as `Nexthop has
+	// invalid gateway` - so a fixture built that way tests the fixture, not the code. Building a
+	// genuinely remote gateway needs a second network namespace, which needs mount privileges this
+	// test process may not have. So this runs where the namespace already has a real default route -
+	// a CI container - and skips where it does not.
+	def, err := exec.Command("ip", "route", "show", "default").Output()
+	if err != nil || len(strings.TrimSpace(string(def))) == 0 {
+		t.Skip("this namespace has no default route, so there is nothing for the container mode to take over")
+	}
+	if !strings.Contains(string(def), "via ") {
+		t.Skip("this namespace's default route has no gateway, so a restore cannot be verified faithfully")
+	}
+
+	// AN ECHO DESTINATION, so a datagram written into the device has somewhere to come from.
+	echo, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+
+	c, err := StartContainer(ContainerConfig{
+		Name:    "cte2e0",
+		Address: "10.98.0.1/24",
+		Logf:    t.Logf,
+	})
+	if err != nil {
+		t.Fatalf("StartContainer: %v", err)
+	}
+	// THE ROUTE MUST COME BACK EVEN IF AN ASSERTION BELOW FAILS.
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+
+	// THE DEFAULT ROUTE IS THE DEVICE NOW.
+	routes, err := exec.Command("ip", "route", "show", "default").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(routes), "dev cte2e0") {
+		t.Fatalf("the default route does not name the device:\n%s", routes)
+	}
+
+	// A LOCAL PROCESS'S DATAGRAM ARRIVES IN THE DEVICE, which is the whole claim: not "the rule was
+	// installed" but "the traffic is here".
+	client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	target := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 99), Port: 443}
+	if _, err := client.WriteToUDP([]byte("container-mode"), target); err != nil {
+		t.Fatalf("the client's datagram: %v", err)
+	}
+
+	// CLOSE, AND THE ROUTE IS RESTORED.
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	after, err := exec.Command("ip", "route", "show", "default").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(after), "dev cte2e0") {
+		t.Fatalf("the default route still points at the device after Close:\n%s", after)
+	}
+	if len(strings.TrimSpace(string(after))) == 0 {
+		t.Fatalf("Close left the namespace with no default route at all:\n%s", after)
+	}
+}
