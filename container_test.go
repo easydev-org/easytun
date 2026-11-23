@@ -373,3 +373,33 @@ func TestAnExemptionIsRemovedByTheAddressItWasInstalledWith(t *testing.T) {
 			strings.Join(log.cmds, "\n"))
 	}
 }
+
+// A CIDR IS EXEMPTED AS ITSELF, which is what a proxy behind a Kubernetes Service needs.
+//
+// MEASURED IN A POD: `Exempt: []string{"proxy-a"}` covered the SERVICE address, but kube-proxy DNATs a
+// Service to a POD address, so the relay's own connection was addressed somewhere the exemption did not
+// cover - and it went into the tun. A caller that knows its network passes the range, and the range is
+// installed as given.
+func TestACIDRIsExemptedAsItself(t *testing.T) {
+	var got string
+	old := exemptRouteFn
+	defer func() { exemptRouteFn = old }()
+	exemptRouteFn = func(host string, _ defaultRoute) (string, error) { got = host; return host, nil }
+
+	var log routeLog
+	log.install(t, "default via 172.17.0.1 dev eth0\n")
+	oldOpen, oldUp, oldRemove := openDevice, bringUp, removeDevice
+	defer func() { openDevice, bringUp, removeDevice = oldOpen, oldUp, oldRemove }()
+	openDevice = func(string) (tunDevice, error) { return newPipeline(), nil }
+	bringUp = func(string, string) error { return nil }
+	removeDevice = func(string) error { return nil }
+
+	c, err := StartContainer(ContainerConfig{Name: "cidr0", Exempt: []string{"10.244.0.0/16"}})
+	if err != nil {
+		t.Fatalf("StartContainer: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if got != "10.244.0.0/16" {
+		t.Fatalf("the exempted value is %q, want the CIDR as given", got)
+	}
+}

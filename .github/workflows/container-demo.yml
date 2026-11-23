@@ -118,25 +118,19 @@ jobs:
                 image: easytun-proxy-tag:test
                 imagePullPolicy: Never
                 args: ["--port", "1081", "--tag", "B", "--log", "/tmp/b.log"]
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: proxy-a
-          spec:
-            selector: {app: proxy, tag: a}
-            ports: [{port: 1080, targetPort: 1080}]
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: proxy-b
-          spec:
-            selector: {app: proxy, tag: b}
-            ports: [{port: 1081, targetPort: 1081}]
           YAML
           kubectl wait --for=condition=Ready pod/proxy-a pod/proxy-b --timeout=120s
-          kubectl get pods,svc
+
+          # THE POD ADDRESSES, NOT A SERVICE. A Service is a ClusterIP that kube-proxy DNATs to a pod
+          # IP, so an exemption for the Service address does not cover the address the connection ends
+          # up at - MEASURED: the proxies logged nothing while the relay's own dial went into the tun.
+          # A pod IP is what the packet carries, so a /32 is exactly enough.
+          A_IP=$(kubectl get pod proxy-a -o jsonpath='{.status.podIP}')
+          B_IP=$(kubectl get pod proxy-b -o jsonpath='{.status.podIP}')
+          echo "proxy-a at $A_IP, proxy-b at $B_IP"
+          echo "PROXY_A_ADDR=$A_IP:1080" >> "$GITHUB_ENV"
+          echo "PROXY_B_ADDR=$B_IP:1081" >> "$GITHUB_ENV"
+          kubectl get pods -o wide
 
       - name: the demo pod, with a device and the capability
         run: |
@@ -153,8 +147,8 @@ jobs:
                 image: ${IMAGE}:${GITHUB_SHA}
                 imagePullPolicy: Never
                 env:
-                  - {name: PROXY_A, value: "proxy-a:1080"}
-                  - {name: PROXY_B, value: "proxy-b:1081"}
+                  - {name: PROXY_A, value: "${PROXY_A_ADDR}"}
+                  - {name: PROXY_B, value: "${PROXY_B_ADDR}"}
                 securityContext:
                   capabilities:
                     add: ["NET_ADMIN"]

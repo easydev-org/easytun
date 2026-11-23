@@ -371,6 +371,20 @@ var exemptRouteFn = exemptRoute
 // A /32 IS SPECIFIC ENOUGH TO WIN OVER THE DEFAULT, which is the point: the route lookup prefers the
 // longest prefix, so the proxy keeps its old way out while everything else moves.
 func exemptRoute(host string, before defaultRoute) (string, error) {
+	// A CIDR IS EXEMPTED AS ITSELF, which is what a proxy behind a Service needs: the connection is
+	// addressed to the ClusterIP and DNAT'd to a pod IP, so a /32 for the Service does not cover it. A
+	// caller that knows its network passes the range.
+	if strings.Contains(host, "/") {
+		args := []string{"route", "replace", host}
+		if before.via != "" {
+			args = append(args, "via", before.via)
+		}
+		args = append(args, "dev", before.dev)
+		if out, err := run("ip", args...); err != nil {
+			return "", fmt.Errorf("ip %v: %v (%s)", args, err, firstLine(out))
+		}
+		return host, nil
+	}
 	ip := net.ParseIP(host)
 	if ip == nil {
 		addrs, err := net.LookupIP(host)
