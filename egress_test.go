@@ -22,6 +22,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -176,13 +177,16 @@ func TestTheRouteIsConsultedForEveryDatagram(t *testing.T) {
 	withStubbedDevices(t, dev)
 	reader := startReplyReader(t, dev)
 
-	var calls int
+	// THE COUNTER IS ATOMIC BECAUSE THE CALLBACK RUNS ON THE RELAY'S GOROUTINE and the assertion reads
+	// it here. A plain `int` is what made this a genuine data race under `-race` in CI - MEASURED: the
+	// race detector named `egress_test.go:204` reading what `func1` at `:185` wrote.
+	var calls atomic.Int64
 	r, err := Start(Config{
 		GuestIP:  "172.30.0.2",
 		Upstream: proxyA.addr(),
 		Name:     "perflow0",
 		Route: func(dst net.IP, _ uint16) Route {
-			calls++
+			calls.Add(1)
 			if dst.String() == "203.0.113.20" {
 				return Route{Upstream: proxyB.addr()}
 			}
@@ -201,8 +205,8 @@ func TestTheRouteIsConsultedForEveryDatagram(t *testing.T) {
 	if got := ask(t, dev, reader, guest, 20002, net.ParseIP("203.0.113.20"), 443, "2", 3*time.Second); got != "B:2" {
 		t.Errorf("second datagram answered %q, want B:2", got)
 	}
-	if calls < 2 {
-		t.Errorf("the route callback ran %d times for two datagrams, want at least 2", calls)
+	if n := calls.Load(); n < 2 {
+		t.Errorf("the route callback ran %d times for two datagrams, want at least 2", n)
 	}
 }
 
