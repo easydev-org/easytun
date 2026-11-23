@@ -244,6 +244,15 @@ func (c *Container) Close() error {
 	// THE DEFAULT ROUTE GOES BACK TO WHAT IT WAS, not to nothing: a container whose default route is
 	// deleted has no way out at all.
 	//
+	// THE RELAY'S OWN DEFAULT ROUTE IS REMOVED FIRST, BY NAME.
+	//
+	// MEASURED: the takeover installs `default dev et0 metric 100`, and restoring `default via <gw> dev
+	// eth0` leaves BOTH - two default routes, one per device. `ip route show default` printed the
+	// restored one, so it looked fine, but the tun's copy outlives the device by a moment and the
+	// namespace's routing is two routes deep. Deleting it by its exact form first is what makes the
+	// restore a replacement rather than an addition.
+	_, _ = run("ip", "route", "del", "default", "dev", c.Name)
+
 	// THE DEFAULT ROUTE GOES BACK EXACTLY AS IT WAS, AND THE GATEWAY IS NOT OPTIONAL.
 	//
 	// MEASURED WHILE WRITING THIS: a `default dev <iface>` WITH NO GATEWAY HIJACKS LOCAL ADDRESSES.

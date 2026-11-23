@@ -21,6 +21,9 @@ import (
 
 func main() {
 	fmt.Println("=== before the takeover ===")
+	if out, _ := exec.Command("ip", "route", "show", "default").Output(); true {
+		fmt.Printf("  (the demo will restore: %q)\n", strings.TrimSpace(string(out)))
+	}
 	show("ip route show default")
 	show("ip addr show")
 
