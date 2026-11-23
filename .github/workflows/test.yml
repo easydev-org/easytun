@@ -1,21 +1,28 @@
 name: test
 
-# THE KERNEL HALF OF THIS PACKAGE CANNOT BE UNIT-TESTED. `IFF_NO_PI`, the ioctl, the policy rule and
-# the route are all things the kernel does to a real device, and a test that mocked them would prove
-# nothing about the ioctl that actually matters. So there are two jobs:
+# THE KERNEL HALF OF THIS PACKAGE CANNOT BE UNIT-TESTED. `IFF_NO_PI`, the ioctl, the policy rule, the
+# default route and the SO_MARK rules are all things the kernel does to a real namespace, and a test
+# that mocked them would prove nothing about the ioctl that actually matters.
 #
-#	test    every machine, no privileges: the packet layer, the SOCKS5 framing, the relay's session
-#	        table and the whole forwarding path, driven through a pipe against a real in-process
-#	        SOCKS5 server. This is the `go test ./...` anyone runs.
+# SO THERE ARE TWO JOBS, AND THE DIFFERENCE IS WHAT THEY MAY TOUCH:
 #
-#	kernel  one runner with `--device /dev/net/tun --cap-add NET_ADMIN`: the same suite PLUS the e2e
-#	        tests, which create a real tun device, install a real policy rule, send a real datagram
-#	        through a real proxy and read the reply back off a real socket.
+#	unit      no privileges, no device. The packet layer, the SOCKS5 framing, the relay's session table
+#	          and the whole forwarding path, driven through a pipe against real in-process servers.
+#	          This is the `go test ./...` anyone runs.
 #
-# AND `unshare -Urn --keep-caps` IS WHY THIS NEEDS NO PRIVILEGED CONTAINER. A user namespace gives the
-# process CAP_NET_ADMIN inside an isolated network namespace, so the policy routing the test installs
-# stays inside that namespace and cannot leak onto the runner. The device node is created once with
-# `mknod` - the tun module is already loaded on every Linux kernel GitHub ships.
+#	kernel    INSIDE A PRIVILEGED CONTAINER with `--device /dev/net/tun --cap-add NET_ADMIN`.
+#
+# WHY THE KERNEL JOB IS A CONTAINER AND NOT `sudo` ON THE RUNNER, WHICH IT USED TO BE
+#
+# THE TESTS CHANGE THE NETWORK NAMESPACE THEY RUN IN: `StartContainer` moves the default route into a
+# tun, installs SO_MARK rules, and puts it back on Close. On the runner that namespace is the RUNNER'S,
+# so a bug in the restore takes the runner's own network with it - and one did: `ip route flush table 0`
+# flushed main, and the symptom was every later step timing out for no stated reason.
+#
+# IN A CONTAINER THE NAMESPACE IS THE CONTAINER'S. A test that breaks the routing breaks one container
+# that is thrown away, and the runner is untouched. It is also what a caller actually does: the README
+# asks for `--device /dev/net/tun --cap-add NET_ADMIN`, so this job runs the documented invocation
+# rather than a root shortcut that no caller has.
 
 on:
   push:
@@ -28,7 +35,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  unit:
     name: unit (no privileges)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -55,24 +62,17 @@ jobs:
         run: go test ./... -count=1 -race -cover
 
   kernel:
-    name: e2e (a real tun device)
+    name: e2e (a real tun device, in a container)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: "1.26"
-          # NO CACHE: this module has no dependencies, so there is no `go.sum` for the cache key and
-          # every run would warn that it could not restore one. Measured on the first green run.
-          cache: false
 
-      # THE DEVICE NODE. The `tun` module is built into (or loaded by) every kernel GitHub's runners
-      # use, so this is the character device that talks to it - major 10, minor 200, which is what
-      # /proc/misc reports as `tun`.
-      - name: ensure /dev/net/tun exists
-        # GITHUB'S RUNNER ALREADY HAS ONE, which is why `mknod` must tolerate EEXIST: MEASURED,
-        # the first version failed here with `mknod: File exists` and never ran a test.
+      # THE DEVICE NODE ON THE HOST. The `tun` module is built into (or loaded by) every kernel
+      # GitHub's runners use, so this is the character device that talks to it - major 10, minor 200,
+      # which is what /proc/misc reports as `tun`. `mknod` tolerates EEXIST because the runner usually
+      # already has one (MEASURED: the first version failed with `mknod: File exists`).
+      - name: ensure the host has /dev/net/tun
         run: |
           set -eux
           if [ ! -e /dev/net/tun ]; then
@@ -83,39 +83,70 @@ jobs:
           ls -l /dev/net/tun
           grep tun /proc/misc
 
-      # THE E2E TESTS SKIP WHEN THEY CANNOT MAKE A DEVICE, so this job asserts they DID NOT SKIP:
-      # a green run that skipped everything proves nothing, and that is the failure mode a skipping
-      # test is famous for.
-      # SUDO, NOT `unshare -Urn`, BECAUSE GITHUB'S RUNNER FORBIDS UNPRIVILEGED USER NAMESPACES.
+      # THE TESTS RUN IN A CONTAINER THAT HAS EXACTLY WHAT THE README ASKS A CALLER FOR.
       #
-      # MEASURED on the first green-attempt: `unshare -Urn --keep-caps` answered
-      # `write failed /proc/self/uid_map: Operation not permitted`, so the namespace is restricted on
-      # this image (Ubuntu 23.10+ with the apparmor restriction). Root already has CAP_NET_ADMIN, so
-      # running the test directly as root needs no namespace at all.
+      # THE SOURCE IS A BIND MOUNT and GOCACHE is a writable path inside it, so the Go toolchain
+      # compiles on every run and nothing is cached in a place the next job cannot see. `-v` of the
+      # module cache would be faster, but this module has no dependencies, so there is nothing to cache.
       #
-      # `unshare` REMAINS THE RIGHT ANSWER ON A MACHINE WITHOUT SUDO, and the README documents it -
-      # but it is not what this runner allows.
-      #
-      # THE TEST INSTALLS A POLICY RULE AND A ROUTE IN WHATEVER NAMESPACE IT RUNS IN, which as root is
-      # the runner's own. That is acceptable HERE because a GitHub runner is discarded after the job,
-      # and the test removes what it installed; it is the reason the README prefers `unshare` for a
-      # machine a person keeps.
-      - name: test, with the kernel half
+      # `--device` RATHER THAN `-v /dev/net` : a bind mount of a character device works, but `--device`
+      # is what the README documents and what makes the container's permission bits right. If the
+      # device is missing, StartContainer refuses with a sentence naming it - which the assertions
+      # below would report as a failure, not a silent skip.
+      # THE CONTAINER MUST HAVE A DEFAULT ROUTE WITH A GATEWAY, because
+      # `TestE2EContainerTakesOverTheDefaultRoute` takes it over and puts it back - and it SKIPS where
+      # there is none, which the assertion below would report as "a kernel test skipped" without
+      # naming the real cause. Docker's default bridge gives that route; this checks it rather than
+      # inheriting an assumption.
+      - name: the container has a default route to take over
         run: |
           set -eux
-          sudo env "PATH=$PATH" "HOME=$HOME" \
-            go test ./... -count=1 -v -run 'E2E|TestOpenTun|TestIfreq' \
-            | tee /tmp/kernel.log
-          if grep -q '^--- SKIP' /tmp/kernel.log; then
-            echo "::error::a kernel test skipped, so the device was not usable in this job"
-            grep -A3 '^--- SKIP' /tmp/kernel.log
-            exit 1
-          fi
-          grep -c '^--- PASS' /tmp/kernel.log
+          # THE SCRIPT IS A FILE, not an awk one-liner escaped through YAML and `sh -c`: three layers
+          # of quoting is how a check becomes a syntax error nobody can read. See the file's own header.
+          docker run --rm -v "$PWD/.github/assert-default-route.sh:/check.sh:ro" \
+            golang:1.26 sh /check.sh
 
-      # AND THE WHOLE SUITE AS ROOT, which is the environment the kernel tests describe. The unit
-      # tests that open a loopback socket call `ensureLoopbackUp` first, so this also proves they pass
-      # where `lo` needed raising - the failure a fresh `unshare -Urn` namespace produced while this
-      # work was being written.
-      - name: the whole suite, as root
-        run: sudo env "PATH=$PATH" "HOME=$HOME" go test ./... -count=1 -race
+      - name: the kernel half, in a container with the device
+        run: |
+          set -eux
+          # ONE CONTAINER RUN, AND ITS EXIT STATUS IS THE ASSERTION. Inside it:
+          #   - the selected tests run with -v so the log names each one
+          #   - a SKIP fails the job, because a green run that skipped every kernel test proves nothing
+          docker run --rm \
+            --device /dev/net/tun:/dev/net/tun \
+            --cap-add NET_ADMIN \
+            -v "$PWD:/src" \
+            -w /src \
+            -e GOCACHE=/tmp/go-cache \
+            -e GOFLAGS=-buildvcs=false \
+            golang:1.26 \
+            sh -c '
+              set -eu
+              go test ./... -count=1 -v -run "E2E|TestOpenTun|TestIfreq" > /tmp/kernel.log 2>&1 || {
+                cat /tmp/kernel.log; exit 1;
+              }
+              cat /tmp/kernel.log
+              if grep -q "^--- SKIP" /tmp/kernel.log; then
+                echo "::error::a kernel test skipped, so the device was not usable in this container"
+                grep -A3 "^--- SKIP" /tmp/kernel.log
+                exit 1
+              fi
+              echo "passed: $(grep -c "^--- PASS" /tmp/kernel.log) kernel tests"
+            '
+
+      # AND THE WHOLE SUITE, in the same container, because the unit tests also have to pass where the
+      # loopback needed raising and where a device exists. Running it twice (once selected, once whole)
+      # is deliberate: the selected run proves the kernel tests RAN rather than skipped, and the whole
+      # run proves the rest still passes in this environment.
+      - name: the whole suite, in the same container
+        run: |
+          set -eux
+          docker run --rm \
+            --device /dev/net/tun:/dev/net/tun \
+            --cap-add NET_ADMIN \
+            -v "$PWD:/src" \
+            -w /src \
+            -e GOCACHE=/tmp/go-cache \
+            -e GOFLAGS=-buildvcs=false \
+            golang:1.26 \
+            sh -c 'go test ./... -count=1 -race'
