@@ -202,7 +202,10 @@ func Start(cfg Config) (*Relay, error) {
 		table:    table,
 		guest:    cfg.GuestIP,
 		sessions: map[key]*session{},
-		done:     make(chan struct{}),
+		// THIS RELAY CREATED THE DEVICE, so it must remove it. The container mode hands its device to a
+		// Container that owns the routing, and a relay there must NOT delete it - see Close.
+		ownsDevice: true,
+		done:       make(chan struct{}),
 	}
 
 	if err := installPolicy(name, cfg.GuestIP, table); err != nil {

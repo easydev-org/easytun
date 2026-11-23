@@ -277,3 +277,48 @@ func TestTheMarkRulesAreInstalledAndRemoved(t *testing.T) {
 			"still find the tun:\n%s", strings.Join(log.cmds, "\n"))
 	}
 }
+
+// START'S RELAY OWNS ITS DEVICE; THE CONTAINER MODE'S DOES NOT.
+//
+// MEASURED AS A LEAK: `Start` built its relay without `ownsDevice`, so Close left the tun behind - the
+// real-kernel test caught it as "the tun device outlived Close", and every `Start` in production leaked
+// a device. The flag exists because the two modes have different owners, and a default of false is the
+// wrong default for the one that CREATED the device.
+func TestOnlyTheRelayThatCreatedTheDeviceRemovesIt(t *testing.T) {
+	var log routeLog
+	log.install(t, "default via 172.17.0.1 dev eth0\n")
+	oldOpen, oldUp, oldRemove := openDevice, bringUp, removeDevice
+	defer func() { openDevice, bringUp, removeDevice = oldOpen, oldUp, oldRemove }()
+	openDevice = func(string) (tunDevice, error) { return newPipeline(), nil }
+	bringUp = func(string, string) error { return nil }
+	removed := 0
+	removeDevice = func(string) error { removed++; return nil }
+
+	// START: created the device, so Close removes it.
+	r, err := Start(Config{GuestIP: "172.30.0.2", Name: "own0"})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("a relay from Start removed the device %d times, want 1 - a device it created and did "+
+			"not delete is a leak", removed)
+	}
+
+	// CONTAINER MODE: the Container owns the device, so the relay must not remove it.
+	removed = 0
+	c, err := StartContainer(ContainerConfig{Name: "own1"})
+	if err != nil {
+		t.Fatalf("StartContainer: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// ONE removal, by the Container itself - not two, which would mean the relay also deleted it.
+	if removed != 1 {
+		t.Fatalf("container mode removed the device %d times, want 1 (by the Container, not the "+
+			"relay)", removed)
+	}
+}
