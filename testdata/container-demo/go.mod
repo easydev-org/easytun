@@ -2,6 +2,4 @@ module containerdemo
 
 go 1.26
 
-require github.com/easydev-org/easytun v0.4.0
-
-replace github.com/easydev-org/easytun => ../..
+require github.com/easydev-org/easytun v0.5.0
