@@ -45,8 +45,28 @@ type Config struct {
 	Logf func(format string, args ...any)
 }
 
+// RouteKind is the explicit form of what a Route asks for, for a caller that prefers an enum to the
+// booleans. A zero Route (no fields set) means "the configured upstream", which is the common case.
+type RouteKind int
+
+const (
+	// RouteUpstream sends the flow through the configured or named upstream.
+	RouteUpstream RouteKind = iota
+	// RouteDirect sends it from this host with no proxy.
+	RouteDirect
+	// RouteDrop discards it.
+	RouteDrop
+)
+
 // Route is what a callback returns for one flow.
 type Route struct {
+	// Kind is the explicit choice. The booleans below are kept because they are what every existing
+	// caller uses, and `Kind` defaults to RouteUpstream so a zero Route is unchanged behaviour.
+	//
+	// A CALLER SETTING BOTH IS A MISTAKE THAT FAILS SAFE: RouteDrop and RouteDirect win, because
+	// refusing or bypassing is never worse than sending traffic through a proxy the caller did not
+	// mean.
+	Kind RouteKind
 	// Direct sends the datagram from this host with no proxy.
 	Direct bool
 	// Drop discards it. There is no RST in UDP, so the guest's client times out - which is what a
@@ -377,7 +397,11 @@ func (r *Relay) forward(k key, payload []byte) error {
 	if r.route != nil {
 		route = r.route(dstIP, k.dstPort)
 	}
-	if route.Drop {
+	// THE EXPLICIT KIND AND THE BOOLEANS BOTH WORK, and the stricter of the two wins: a caller that
+	// set Kind=RouteDrop and forgot to clear Direct still gets a drop.
+	drop := route.Drop || route.Kind == RouteDrop
+	direct := route.Direct || route.Kind == RouteDirect
+	if drop {
 		return nil
 	}
 	// THE NAME, WHEN THE CALLER NAMED ONE. A fake destination is an address this caller invented, so
@@ -387,7 +411,7 @@ func (r *Relay) forward(k key, payload []byte) error {
 		k.host = route.Host
 	}
 
-	if route.Direct {
+	if direct {
 		// A DIRECT FLOW WITH A NAME DIALS THE NAME, because a fake address leads nowhere and the
 		// caller told us what it stands for.
 		return r.forwardDirect(k, dstIP, payload)

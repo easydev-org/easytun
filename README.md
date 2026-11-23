@@ -1,6 +1,17 @@
 # easytun
 
-Relay a guest's UDP through a SOCKS5 proxy, using a tun device the container owns.
+Egress control for a container: relay a workload's TCP and UDP through proxies, with a rule deciding
+each destination's path.
+
+Three packages, usable together or alone:
+
+| package | what it does | needs |
+|---|---|---|
+| `easytun` | UDP through a tun device (SOCKS5 `UDP ASSOCIATE`), and TCP through a transparent listener (HTTP `CONNECT`) | tun: `/dev/net/tun` + `NET_ADMIN`. TCP: neither |
+| `easytun/egress` | the rule engine: `block` / `direct` / `proxy:NAME`, by address, CIDR, name or port | nothing |
+| `easytun/names` | a DNS server that records answers, with an optional fake-ip pool | nothing |
+
+A rule means the same thing to TCP and UDP because both ask one table.
 
 ```go
 import "github.com/easydev-org/easytun"
@@ -50,6 +61,24 @@ Two things, and they fail differently:
 
 `Preflight()` answers both **before anything is created**, because the raw failure arrives at an
 `ip link add` and reads as a broken network rather than a missing capability.
+
+## TCP, without a device
+
+A transparent TCP proxy needs no tun and no capability — only a port and one iptables rule that the
+caller writes, because the rule is about the caller's topology:
+
+```go
+tcp, err := easytun.StartTCP(easytun.TCPConfig{
+    Bind:     "0.0.0.0:0",              // port 0: read Port() back and put it in the rule
+    Upstream: "mihomo:7890",
+    Route:    func(dst net.IP, port uint16) easytun.Route { ... },
+})
+// iptables -t nat -A PREROUTING -p tcp -j DNAT --to-destination <bind>:<tcp.Port()>
+```
+
+`Bind` must be an address the workload can reach — **not** `127.0.0.1`, because the workload's packets
+are forwarded through this host, and loopback belongs to the workload's own stack once the packet is no
+longer local.
 
 ## What it does, precisely
 
