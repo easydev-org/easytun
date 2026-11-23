@@ -1,27 +1,27 @@
 # THE CONTAINER-MODE DEMO IMAGE.
 #
 # It carries ONE program and the tools that program calls: `ip` (real iproute2, because busybox's has no
-# `ipproto`). That is the whole dependency list for taking over a container's network with easytun - no
-# proxy, no DNS server, no sidecar.
+# `ipproto` or `fwmark`). That is the whole dependency list for taking over a container's network with
+# easytun - no proxy, no DNS server, no sidecar.
 FROM golang:1.26-alpine AS build
 WORKDIR /src
-# THE MODULE PROXY, EXPLICITLY. MEASURED: without it the image's `go mod download` fell back to `direct`,
-# which needs `git` - and the alpine golang image has none, so the build failed with
-# `failed to execute git version: exec: "git": executable file not found in $PATH`. A proxy fetch needs
-# no git, which is what makes this image buildable from a bare toolchain.
-ENV GOPROXY=https://proxy.golang.org,direct
-# THE DEMO IS ITS OWN MODULE (testdata/container-demo), so it resolves easytun by its published tag -
-# which is what makes this image prove the version a caller actually gets. The library's root has no
-# go.sum because it has no dependencies, so only the demo's module files are copied here.
-COPY testdata/container-demo/go.mod testdata/container-demo/go.sum ./
-RUN go mod download
-COPY testdata/container-demo/ ./
-RUN CGO_ENABLED=0 go build -o /out/demo .
+
+# THE LIBRARY COMES FROM THIS CHECKOUT, NOT FROM A TAG. MEASURED: `require ... v0.5.0` in the demo's
+# go.mod needs the module proxy to know that tag, and a tag pushed minutes earlier is not indexed yet -
+# the fetch falls back to `direct`, which needs git, and the alpine golang image has none. Building
+# against the checkout is also the more useful thing: the image proves THIS COMMIT, not whatever a tag
+# happened to be.
+COPY . /src
+
+# THE DEMO'S GO.MOD POINTS AT THE LIBRARY BY A RELATIVE PATH, which is what a module inside this
+# repository should do; a published tag is what an OUTSIDE caller uses, and that path is covered by the
+# egress job.
+RUN cd testdata/container-demo && \
+    go mod edit -replace github.com/easydev-org/easytun=/src && \
+    go mod tidy && \
+    CGO_ENABLED=0 go build -o /out/demo .
 
 FROM alpine:3.21
-# REAL iproute2, NOT BUSYBOX. MEASURED: alpine's /sbin/ip is busybox, which cannot do `rule ... ipproto`
-# and answers `invalid argument 'ipproto' to 'ip'` - a sentence that names neither the binary nor the
-# package. This mode also installs fwmark rules, which busybox likewise lacks.
 RUN apk add --no-cache iproute2
 COPY --from=build /out/demo /usr/local/bin/demo
 # THE DEVICE IS NOT IN THE IMAGE: the runtime gives it with `--device /dev/net/tun` (or a hostPath in a
